@@ -1,0 +1,9 @@
+{
+  "base_url": "http://your-backend.example.com",
+  "auth": {
+    "token": "Bearer replace_with_your_token",
+    "uid": "replace_with_uid",
+    "email": "replace_with_email@example.com"
+  }
+}
+
