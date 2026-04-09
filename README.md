@@ -81,6 +81,7 @@ python src/tests/run_5turn_session_test.py
 
 - 仓库默认提供 `config/config.example.json` 作为模板。
 - `test.txt` / `test_re.txt` 为兼容历史格式，仓库内默认不提供示例文件。
+- 评估 LLM 的接口信息建议写入 `config/*.json` 的 `llm_eval` 字段（`enabled/base_url/model/api_key/timeout_sec`）。
 
 ---
 

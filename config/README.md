@@ -19,6 +19,16 @@
 - `auth.token`: `Bearer xxx` 或 raw token（代码会自动补 Bearer）
 - `auth.uid`: 用户 ID
 - `auth.email`: 用户邮箱
+- `llm_eval.enabled`: 是否启用 LLM 评估（`true/false`）
+- `llm_eval.base_url`: 评估模型接口地址（支持 `.../chat/completions` 或 `.../responses`）
+- `llm_eval.model`: 评估模型名（如 `gpt-5.3-codex`）
+- `llm_eval.api_key`: 评估模型 API Key
+- `llm_eval.timeout_sec`: 评估请求超时（秒）
+
+说明：
+
+- LLM 评估优先读取 `llm_eval` 配置；未配置字段会回退到环境变量。
+- 兼容环境变量：`AUTO_TEST_ENABLE_LLM_EVAL`、`AUTO_TEST_EVAL_LLM_URL`、`AUTO_TEST_EVAL_LLM_MODEL`、`AUTO_TEST_EVAL_LLM_API_KEY`、`AUTO_TEST_EVAL_LLM_TIMEOUT_SEC`。
 
 ---
 

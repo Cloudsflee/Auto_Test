@@ -4,6 +4,12 @@
     "token": "Bearer replace_with_your_token",
     "uid": "replace_with_uid",
     "email": "replace_with_email@example.com"
+  },
+  "llm_eval": {
+    "enabled": false,
+    "base_url": "https://api.ikuncode.cc/v1/responses",
+    "model": "gpt-5.3-codex",
+    "api_key": "replace_with_eval_api_key",
+    "timeout_sec": 60
   }
 }
-

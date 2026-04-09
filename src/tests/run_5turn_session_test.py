@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import time
@@ -18,7 +19,7 @@ SRC_DIR = AUTO_TEST_DIR / "src"
 if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
-from eval.dialogue_evaluator import evaluate_rules, evaluate_with_llm, write_evaluation_md
+from eval.dialogue_evaluator import LLMEvalConfig, evaluate_rules, evaluate_with_llm, write_evaluation_md
 
 
 CFG_PATH_CANDIDATES = [
@@ -36,6 +37,7 @@ class AuthConfig:
     uid: str
     email: str
     source_path: Path
+    llm_eval: dict[str, Any]
 
 
 @dataclass
@@ -107,6 +109,38 @@ def _env_bool(key: str, default: bool) -> bool:
     return default
 
 
+def _cfg_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _cfg_int(value: Any, default: int) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return default
+        try:
+            return int(raw)
+        except Exception:
+            return default
+    return default
+
+
 def resolve_config_path() -> Path:
     for path in CFG_PATH_CANDIDATES:
         if path.exists():
@@ -127,11 +161,21 @@ def _load_json_config(path: Path) -> AuthConfig:
     token = str(auth.get("token", "") or obj.get("token", "")).strip()
     uid = str(auth.get("uid", "") or obj.get("uid", "")).strip()
     email = str(auth.get("email", "") or obj.get("email", "")).strip()
+    llm_eval = obj.get("llm_eval")
+    if not isinstance(llm_eval, dict):
+        llm_eval = {}
 
     if not base_url or not token or not uid or not email:
         raise RuntimeError(f"缺少必填字段: base_url/token/uid/email, path={path.as_posix()}")
 
-    return AuthConfig(base_url=base_url, token=token, uid=uid, email=email, source_path=path)
+    return AuthConfig(
+        base_url=base_url,
+        token=token,
+        uid=uid,
+        email=email,
+        source_path=path,
+        llm_eval=llm_eval,
+    )
 
 
 def _load_text_config(path: Path) -> AuthConfig:
@@ -142,7 +186,14 @@ def _load_text_config(path: Path) -> AuthConfig:
     email = _pick_text_value(text, "email")
     if not base_url or not token or not uid or not email:
         raise RuntimeError(f"缺少必填字段: base_url/token/uid/email, path={path.as_posix()}")
-    return AuthConfig(base_url=base_url, token=token, uid=uid, email=email, source_path=path)
+    return AuthConfig(
+        base_url=base_url,
+        token=token,
+        uid=uid,
+        email=email,
+        source_path=path,
+        llm_eval={},
+    )
 
 
 def load_config(path: Path) -> AuthConfig:
@@ -167,6 +218,23 @@ def mask_token(token: str) -> str:
     if len(raw) <= 16:
         return "*" * len(raw)
     return f"{raw[:8]}...{raw[-8:]}"
+
+
+def build_llm_eval_config(cfg: AuthConfig) -> LLMEvalConfig:
+    llm_cfg = cfg.llm_eval if isinstance(cfg.llm_eval, dict) else {}
+    return LLMEvalConfig(
+        enabled=_cfg_bool(
+            llm_cfg.get("enabled"),
+            _env_bool("AUTO_TEST_ENABLE_LLM_EVAL", False),
+        ),
+        base_url=str(llm_cfg.get("base_url") or llm_cfg.get("url") or os.getenv("AUTO_TEST_EVAL_LLM_URL", "")).strip(),
+        model=str(llm_cfg.get("model") or os.getenv("AUTO_TEST_EVAL_LLM_MODEL", "")).strip(),
+        api_key=str(llm_cfg.get("api_key") or llm_cfg.get("key") or os.getenv("AUTO_TEST_EVAL_LLM_API_KEY", "")).strip(),
+        timeout_sec=_cfg_int(
+            llm_cfg.get("timeout_sec"),
+            _env_int("AUTO_TEST_EVAL_LLM_TIMEOUT_SEC", 30),
+        ),
+    )
 
 
 def now_stamp() -> str:
@@ -524,6 +592,7 @@ def main() -> int:
 
     turns = build_turns()
     run_settings = build_run_settings()
+    llm_eval_cfg = build_llm_eval_config(cfg)
     persist_type = build_persist_type()
     exec_max_turns = build_exec_max_turns()
     create_settings_json = build_create_settings_json(run_settings)
@@ -534,6 +603,10 @@ def main() -> int:
     print(f"[INFO] run_settings={json.dumps(run_settings, ensure_ascii=False, sort_keys=True)}")
     if create_settings_json:
         print(f"[INFO] create_settings={create_settings_json}")
+    print(f"[INFO] llm_eval_enabled={llm_eval_cfg.enabled}")
+    if llm_eval_cfg.enabled:
+        print(f"[INFO] llm_eval_url={llm_eval_cfg.base_url}")
+        print(f"[INFO] llm_eval_model={llm_eval_cfg.model}")
 
     raw_events_path = result_dir / "raw_events.jsonl"
     with raw_events_path.open("w", encoding="utf-8") as raw_fp:
@@ -590,7 +663,12 @@ def main() -> int:
     pass_threshold = _env_float("AUTO_TEST_EVAL_PASS_THRESHOLD", 0.80)
     expected_facts = build_expected_facts()
     rule_eval = evaluate_rules(results, expected_facts=expected_facts, pass_threshold=pass_threshold)
-    llm_eval = evaluate_with_llm(results, expected_facts=expected_facts, prompts_dir=AUTO_TEST_DIR / "prompts")
+    llm_eval = evaluate_with_llm(
+        results,
+        expected_facts=expected_facts,
+        prompts_dir=AUTO_TEST_DIR / "prompts",
+        llm_cfg=llm_eval_cfg,
+    )
 
     (non_text_dir / "evaluation.json").write_text(
         json.dumps(

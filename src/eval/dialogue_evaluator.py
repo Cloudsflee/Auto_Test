@@ -223,12 +223,130 @@ def _build_llm_prompts(
     return system_template, user_prompt
 
 
+def _extract_text_from_content_field(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+        return "".join(parts)
+    return ""
+
+
+def _extract_text_from_chat_payload(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+
+    first = choices[0]
+    if not isinstance(first, dict):
+        return ""
+
+    msg = first.get("message")
+    if isinstance(msg, dict):
+        return _extract_text_from_content_field(msg.get("content")).strip()
+
+    delta = first.get("delta")
+    if isinstance(delta, dict):
+        return _extract_text_from_content_field(delta.get("content")).strip()
+    return ""
+
+
+def _extract_text_from_responses_payload(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+
+    output = payload.get("output")
+    parts: list[str] = []
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "output_text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                continue
+            if item.get("type") != "message":
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        joined = "".join(parts).strip()
+        if joined:
+            return joined
+
+    output_text = payload.get("output_text")
+    if isinstance(output_text, str):
+        return output_text.strip()
+    return ""
+
+
+def _extract_text_from_sse_stream(raw_text: str) -> str:
+    parts: list[str] = []
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        chunk = _safe_json_loads(data)
+        if not isinstance(chunk, dict):
+            continue
+        text = _extract_text_from_chat_payload(chunk)
+        if text:
+            parts.append(text)
+    return "".join(parts).strip()
+
+
+def _detect_wire_api(url: str) -> str:
+    lower = (url or "").lower()
+    if lower.endswith("/responses") or "/responses?" in lower:
+        return "responses"
+    return "chat_completions"
+
+
+def _parse_llm_text(
+    wire_api: str,
+    content_type: str,
+    raw_text: str,
+) -> tuple[dict[str, Any] | None, str]:
+    payload = _safe_json_loads(raw_text)
+    text = ""
+
+    if wire_api == "responses":
+        text = _extract_text_from_responses_payload(payload)
+    else:
+        text = _extract_text_from_chat_payload(payload)
+
+    # 某些网关会返回 SSE（data: ...），这里做兜底解析。
+    if not text and ("text/event-stream" in content_type or raw_text.lstrip().startswith("data:")):
+        text = _extract_text_from_sse_stream(raw_text)
+
+    return (payload if isinstance(payload, dict) else None), text
+
+
 def evaluate_with_llm(
     results: list[dict[str, Any]],
     expected_facts: dict[str, str],
     prompts_dir: Path,
+    llm_cfg: LLMEvalConfig | None = None,
 ) -> dict[str, Any]:
-    cfg = load_llm_eval_config_from_env()
+    cfg = llm_cfg or load_llm_eval_config_from_env()
     if not cfg.enabled:
         return {
             "enabled": False,
@@ -248,26 +366,41 @@ def evaluate_with_llm(
         "Authorization": f"Bearer {cfg.api_key}",
         "Content-Type": "application/json",
     }
-    body = {
-        "model": cfg.model,
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    }
+    wire_api = _detect_wire_api(cfg.base_url)
+    if wire_api == "responses":
+        body = {
+            "model": cfg.model,
+            "temperature": 0,
+            "input": [
+                {
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": system_prompt}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": user_prompt}],
+                },
+            ],
+            "text": {"format": {"type": "json_object"}},
+        }
+    else:
+        body = {
+            "model": cfg.model,
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
 
     try:
         resp = requests.post(cfg.base_url, headers=headers, json=body, timeout=cfg.timeout_sec)
         status_code = resp.status_code
         resp.raise_for_status()
-        payload = resp.json()
-        content = (
-            ((payload.get("choices") or [{}])[0].get("message") or {}).get("content")
-            if isinstance(payload, dict)
-            else ""
-        )
+        raw_text = resp.text if isinstance(resp.text, str) else ""
+        content_type = (resp.headers.get("Content-Type") or "").lower()
+        payload, content = _parse_llm_text(wire_api=wire_api, content_type=content_type, raw_text=raw_text)
         parsed = _safe_json_loads(content) if isinstance(content, str) else None
         return {
             "enabled": True,
@@ -275,8 +408,10 @@ def evaluate_with_llm(
             "status_code": status_code,
             "model": cfg.model,
             "base_url": cfg.base_url,
+            "wire_api": wire_api,
             "response_json": parsed if isinstance(parsed, dict) else None,
             "response_text": content if isinstance(content, str) else "",
+            "raw_response_preview": raw_text[:1000],
         }
     except Exception as exc:
         return {
@@ -325,4 +460,3 @@ def write_evaluation_md(path: Path, rule_eval: dict[str, Any], llm_eval: dict[st
             lines.append("- response_json: `(not valid JSON)`")
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
