@@ -11,5 +11,17 @@
     "model": "gpt-5.3-codex",
     "api_key": "replace_with_eval_api_key",
     "timeout_sec": 60
+  },
+  "user_simulator": {
+    "enabled": false,
+    "mode": "provider_context",
+    "base_url": "https://api.ikuncode.cc/v1/responses",
+    "model": "gpt-5.3-codex",
+    "api_key": "replace_with_user_simulator_api_key",
+    "timeout_sec": 60,
+    "max_turns": 20,
+    "first_user_message": "请清空当前notebook内的所有内容，包括files和workbook。我叫阿龙，我的品牌叫星野咖啡，主打低糖拿铁。请记住这三个信息。",
+    "system_prompt_file": "user_simulator_system.prompt",
+    "scenario_prompt_file": "user_simulator_scenario.prompt"
   }
 }

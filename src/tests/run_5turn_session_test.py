@@ -38,6 +38,7 @@ class AuthConfig:
     email: str
     source_path: Path
     llm_eval: dict[str, Any]
+    user_simulator: dict[str, Any]
 
 
 @dataclass
@@ -47,6 +48,35 @@ class TraceInfo:
     tracestate: str
     x_trace_id: str
     backend_trace_id: str
+
+
+@dataclass
+class UserSimulatorConfig:
+    enabled: bool
+    mode: str
+    base_url: str
+    model: str
+    api_key: str
+    timeout_sec: int
+    max_turns: int
+    first_user_message: str
+    system_prompt: str
+    scenario_prompt: str
+
+
+@dataclass
+class UserSimulatorState:
+    previous_response_id: str
+
+
+REQUIRED_NOTEBOOK_CLEAR_TEXT = "请清空当前notebook内的所有内容，包括files和workbook"
+DEFAULT_FIRST_USER_TEXT = (
+    REQUIRED_NOTEBOOK_CLEAR_TEXT
+    + "。我叫阿龙，我的品牌叫星野咖啡，主打低糖拿铁。请记住这三个信息。"
+)
+PROMPTS_DIR = AUTO_TEST_DIR / "prompts"
+DEFAULT_USER_SIM_SYSTEM_PROMPT_FILE = PROMPTS_DIR / "user_simulator_system.prompt"
+DEFAULT_USER_SIM_SCENARIO_PROMPT_FILE = PROMPTS_DIR / "user_simulator_scenario.prompt"
 
 
 def _pick_text_value(text: str, key: str) -> str:
@@ -59,6 +89,23 @@ def _safe_json_loads(text: str) -> Any:
         return json.loads(text)
     except Exception:
         return None
+
+
+def _resolve_prompt_path(file_name: str, default_path: Path) -> Path:
+    name = (file_name or "").strip()
+    if not name:
+        return default_path
+    as_path = Path(name)
+    if as_path.is_absolute():
+        return as_path
+    return PROMPTS_DIR / as_path
+
+
+def _load_prompt_template(prompt_path: Path, fallback: str) -> str:
+    if not prompt_path.exists():
+        return fallback
+    text = prompt_path.read_text(encoding="utf-8", errors="ignore").strip()
+    return text or fallback
 
 
 def _parse_trace_id_from_traceparent(traceparent: str) -> str:
@@ -164,6 +211,9 @@ def _load_json_config(path: Path) -> AuthConfig:
     llm_eval = obj.get("llm_eval")
     if not isinstance(llm_eval, dict):
         llm_eval = {}
+    user_simulator = obj.get("user_simulator")
+    if not isinstance(user_simulator, dict):
+        user_simulator = {}
 
     if not base_url or not token or not uid or not email:
         raise RuntimeError(f"缺少必填字段: base_url/token/uid/email, path={path.as_posix()}")
@@ -175,6 +225,7 @@ def _load_json_config(path: Path) -> AuthConfig:
         email=email,
         source_path=path,
         llm_eval=llm_eval,
+        user_simulator=user_simulator,
     )
 
 
@@ -193,6 +244,7 @@ def _load_text_config(path: Path) -> AuthConfig:
         email=email,
         source_path=path,
         llm_eval={},
+        user_simulator={},
     )
 
 
@@ -235,6 +287,298 @@ def build_llm_eval_config(cfg: AuthConfig) -> LLMEvalConfig:
             _env_int("AUTO_TEST_EVAL_LLM_TIMEOUT_SEC", 30),
         ),
     )
+
+
+def _ensure_required_note_clear_text(text: str) -> str:
+    normalized = (text or "").strip()
+    if not normalized:
+        return DEFAULT_FIRST_USER_TEXT
+    if normalized.startswith(REQUIRED_NOTEBOOK_CLEAR_TEXT):
+        return normalized
+    return f"{REQUIRED_NOTEBOOK_CLEAR_TEXT}。{normalized}"
+
+
+def _detect_wire_api(url: str) -> str:
+    lower = (url or "").lower()
+    if lower.endswith("/responses") or "/responses?" in lower:
+        return "responses"
+    return "chat_completions"
+
+
+def _extract_text_from_content_field(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            text = item.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+        return "".join(parts)
+    return ""
+
+
+def _extract_text_from_chat_payload(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0]
+    if not isinstance(first, dict):
+        return ""
+
+    msg = first.get("message")
+    if isinstance(msg, dict):
+        return _extract_text_from_content_field(msg.get("content")).strip()
+
+    delta = first.get("delta")
+    if isinstance(delta, dict):
+        return _extract_text_from_content_field(delta.get("content")).strip()
+    return ""
+
+
+def _extract_text_from_responses_payload(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    parts: list[str] = []
+    output = payload.get("output")
+    if isinstance(output, list):
+        for item in output:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "output_text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+                continue
+            if item.get("type") != "message":
+                continue
+            content = item.get("content")
+            if not isinstance(content, list):
+                continue
+            for block in content:
+                if not isinstance(block, dict):
+                    continue
+                text = block.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+    merged = "".join(parts).strip()
+    if merged:
+        return merged
+    output_text = payload.get("output_text")
+    if isinstance(output_text, str):
+        return output_text.strip()
+    return ""
+
+
+def _extract_text_from_sse_stream(raw_text: str) -> str:
+    chunks: list[str] = []
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line.startswith("data:"):
+            continue
+        data = line[5:].strip()
+        if not data or data == "[DONE]":
+            continue
+        chunk = _safe_json_loads(data)
+        if not isinstance(chunk, dict):
+            continue
+        text = _extract_text_from_chat_payload(chunk)
+        if text:
+            chunks.append(text)
+    return "".join(chunks).strip()
+
+
+def build_user_simulator_config(cfg: AuthConfig, llm_eval_cfg: LLMEvalConfig) -> UserSimulatorConfig:
+    sim_cfg = cfg.user_simulator if isinstance(cfg.user_simulator, dict) else {}
+
+    mode = str(sim_cfg.get("mode") or os.getenv("AUTO_TEST_USER_SIM_MODE", "provider_context")).strip().lower()
+    if mode not in {"provider_context", "explicit_context"}:
+        mode = "provider_context"
+
+    first_user_message = _ensure_required_note_clear_text(
+        str(sim_cfg.get("first_user_message") or "").strip() or DEFAULT_FIRST_USER_TEXT
+    )
+
+    default_system_prompt = (
+        "你是自动化测试中的“客户用户模拟器”。"
+        "你的任务是基于助手上一轮回复，生成下一轮用户提问。"
+        "你必须只返回 JSON，对象字段包含：user_text, stop, reason。"
+        "其中 user_text 必须是给助手的自然语言用户输入，不要输出解释。"
+    )
+    default_scenario_prompt = (
+        "你在扮演随机客户，与助手进行多轮沟通。\n"
+        "事实背景：\n{{EXPECTED_FACTS}}\n\n"
+        "随机性要求：\n"
+        "1. 每轮随机选择一个意图提问，不固定顺序。\n"
+        "2. 意图池：口号创作/卖点追问/预算约束/竞品比较/复述核对/总结要求。\n"
+        "3. 语气随机（正式、口语、追问、质疑），长度随机（10~80字）。\n"
+        "4. 不要重复上一轮用户句式。\n\n"
+        "轮次上限：{{MAX_TURNS}}。仅在你认为目标完成时再 stop=true。"
+    )
+    system_prompt_path = _resolve_prompt_path(
+        str(sim_cfg.get("system_prompt_file") or "").strip(),
+        DEFAULT_USER_SIM_SYSTEM_PROMPT_FILE,
+    )
+    scenario_prompt_path = _resolve_prompt_path(
+        str(sim_cfg.get("scenario_prompt_file") or "").strip(),
+        DEFAULT_USER_SIM_SCENARIO_PROMPT_FILE,
+    )
+    system_prompt = str(sim_cfg.get("system_prompt") or "").strip() or _load_prompt_template(
+        system_prompt_path,
+        default_system_prompt,
+    )
+    scenario_prompt = str(sim_cfg.get("scenario_prompt") or "").strip() or _load_prompt_template(
+        scenario_prompt_path,
+        default_scenario_prompt,
+    )
+
+    return UserSimulatorConfig(
+        enabled=_cfg_bool(
+            sim_cfg.get("enabled"),
+            _env_bool("AUTO_TEST_ENABLE_USER_SIMULATOR", False),
+        ),
+        mode=mode,
+        base_url=str(
+            sim_cfg.get("base_url")
+            or sim_cfg.get("url")
+            or os.getenv("AUTO_TEST_USER_SIM_BASE_URL", "")
+            or llm_eval_cfg.base_url
+        ).strip(),
+        model=str(sim_cfg.get("model") or os.getenv("AUTO_TEST_USER_SIM_MODEL", "") or llm_eval_cfg.model).strip(),
+        api_key=str(sim_cfg.get("api_key") or sim_cfg.get("key") or os.getenv("AUTO_TEST_USER_SIM_API_KEY", "")).strip()
+        or llm_eval_cfg.api_key,
+        timeout_sec=_cfg_int(
+            sim_cfg.get("timeout_sec"),
+            _env_int("AUTO_TEST_USER_SIM_TIMEOUT_SEC", 60),
+        ),
+        max_turns=max(1, min(128, _cfg_int(sim_cfg.get("max_turns"), _env_int("AUTO_TEST_USER_SIM_MAX_TURNS", 5)))),
+        first_user_message=first_user_message,
+        system_prompt=system_prompt,
+        scenario_prompt=scenario_prompt,
+    )
+
+
+def _render_history_for_user_sim(results: list[dict[str, Any]], max_items: int = 6) -> str:
+    if not results:
+        return "(empty)"
+    tail = results[-max_items:]
+    lines: list[str] = []
+    for item in tail:
+        lines.extend(
+            [
+                f"Turn {item.get('turn')}",
+                f"User: {item.get('user_text') or ''}",
+                f"Assistant: {item.get('assistant_text') or ''}",
+                "",
+            ]
+        )
+    return "\n".join(lines).strip()
+
+
+def _render_user_sim_scenario(template: str, expected_facts: dict[str, str], max_turns: int) -> str:
+    facts = "\n".join(f"- {k}: {v}" for k, v in expected_facts.items())
+    return (
+        (template or "")
+        .replace("{{EXPECTED_FACTS}}", facts)
+        .replace("{{MAX_TURNS}}", str(max_turns))
+    )
+
+
+def _parse_user_sim_output(content: str) -> tuple[str, bool, str]:
+    parsed = _safe_json_loads(content)
+    if isinstance(parsed, dict):
+        user_text = str(
+            parsed.get("user_text") or parsed.get("next_user_message") or parsed.get("message") or ""
+        ).strip()
+        stop = _cfg_bool(parsed.get("stop"), False)
+        reason = str(parsed.get("reason") or "").strip()
+        return user_text, stop, reason
+    return content.strip(), False, ""
+
+
+def generate_user_turn_with_simulator(
+    sim_cfg: UserSimulatorConfig,
+    sim_state: UserSimulatorState,
+    results: list[dict[str, Any]],
+    expected_facts: dict[str, str],
+    turn_idx: int,
+) -> tuple[str, bool, UserSimulatorState]:
+    scenario_prompt = _render_user_sim_scenario(sim_cfg.scenario_prompt, expected_facts, sim_cfg.max_turns)
+    latest_assistant = str((results[-1] if results else {}).get("assistant_text") or "")
+    history_text = _render_history_for_user_sim(results)
+
+    user_prompt = (
+        f"当前请生成第 {turn_idx} 轮用户输入。\n\n"
+        f"场景要求：\n{scenario_prompt}\n\n"
+        f"最近多轮记录：\n{history_text}\n\n"
+        f"上一轮助手回复：\n{latest_assistant}\n\n"
+        "输出要求：\n"
+        "1. 只输出 JSON。\n"
+        "2. JSON 格式：{\"user_text\":\"...\",\"stop\":false,\"reason\":\"\"}\n"
+        "3. user_text 里不要出现工具调用、JSON、XML。\n"
+        "4. 如果应该结束，stop=true 且 user_text 置空。"
+    )
+
+    headers = {
+        "Authorization": f"Bearer {sim_cfg.api_key}",
+        "Content-Type": "application/json",
+    }
+    wire_api = _detect_wire_api(sim_cfg.base_url)
+    body: dict[str, Any]
+    if wire_api == "responses":
+        body = {
+            "model": sim_cfg.model,
+            "temperature": 0.7,
+            "input": [
+                {
+                    "role": "system",
+                    "content": [{"type": "input_text", "text": sim_cfg.system_prompt}],
+                },
+                {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": user_prompt}],
+                },
+            ],
+            "text": {"format": {"type": "json_object"}},
+        }
+        if sim_cfg.mode == "provider_context" and sim_state.previous_response_id:
+            body["previous_response_id"] = sim_state.previous_response_id
+    else:
+        body = {
+            "model": sim_cfg.model,
+            "temperature": 0.7,
+            "response_format": {"type": "json_object"},
+            "messages": [
+                {"role": "system", "content": sim_cfg.system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+        }
+
+    resp = requests.post(sim_cfg.base_url, headers=headers, json=body, timeout=sim_cfg.timeout_sec)
+    resp.raise_for_status()
+    raw_text = resp.text if isinstance(resp.text, str) else ""
+    payload = _safe_json_loads(raw_text)
+
+    if wire_api == "responses":
+        content = _extract_text_from_responses_payload(payload)
+    else:
+        content = _extract_text_from_chat_payload(payload)
+
+    if not content and raw_text.lstrip().startswith("data:"):
+        content = _extract_text_from_sse_stream(raw_text)
+
+    user_text, stop, _ = _parse_user_sim_output(content)
+    next_prev_id = ""
+    if isinstance(payload, dict):
+        next_prev_id = str(payload.get("id") or "").strip()
+
+    if not user_text and not stop:
+        raise RuntimeError(f"user_simulator 输出为空: {content[:200]}")
+    return user_text, stop, UserSimulatorState(previous_response_id=next_prev_id or sim_state.previous_response_id)
 
 
 def now_stamp() -> str:
@@ -419,7 +763,7 @@ def execute_turn(
 def build_turns() -> list[str]:
     # 说明：用 Unicode 转义，避免 Windows 终端编码导致中文变成 ????。
     return [
-        "\u8bf7\u6e05\u7a7a\u5f53\u524dnotebook\u5185\u7684\u6240\u6709\u5185\u5bb9\uff0c\u5305\u62ecfiles\u548cworkbook\u3002\u6211\u53eb\u963f\u9f99\uff0c\u6211\u7684\u54c1\u724c\u53eb\u661f\u91ce\u5496\u5561\uff0c\u4e3b\u6253\u4f4e\u7cd6\u62ff\u94c1\u3002\u8bf7\u8bb0\u4f4f\u8fd9\u4e09\u4e2a\u4fe1\u606f\u3002",
+        DEFAULT_FIRST_USER_TEXT,
         "\u57fa\u4e8e\u6211\u7684\u54c1\u724c\u5b9a\u4f4d\uff0c\u7ed9\u6211\u4e09\u6761\u53e3\u53f7\uff0c\u6bcf\u6761\u4e0d\u8d85\u8fc712\u4e2a\u5b57\u3002",
         "\u5148\u4e0d\u7528\u53e3\u53f7\u4e86\uff0c\u4f60\u7b80\u5355\u8bf4\u8bf4\u4f4e\u7cd6\u996e\u98df\u6709\u54ea\u4e9b\u597d\u5904\u3002",
         "\u73b0\u5728\u8bf7\u56de\u7b54\uff1a\u6211\u53eb\u4ec0\u4e48\uff1f\u54c1\u724c\u540d\u53eb\u4ec0\u4e48\uff1f\u4e3b\u6253\u4ec0\u4e48\uff1f",
@@ -497,6 +841,7 @@ def write_meta_md(
     cfg: AuthConfig,
     session_id: str,
     run_id: str,
+    user_sim_cfg: UserSimulatorConfig,
     persist_type: int,
     exec_max_turns: int,
     create_settings_json: str | None,
@@ -516,6 +861,11 @@ def write_meta_md(
         f"- token(masked): `{mask_token(cfg.token)}`",
         f"- config_source: `{cfg.source_path.as_posix()}`",
         f"- created_at: `{datetime.now().isoformat(timespec='seconds')}`",
+        f"- user_simulator_enabled: `{user_sim_cfg.enabled}`",
+        f"- user_simulator_mode: `{user_sim_cfg.mode}`",
+        f"- user_simulator_max_turns: `{user_sim_cfg.max_turns}`",
+        f"- user_simulator_model: `{user_sim_cfg.model}`",
+        f"- user_simulator_base_url: `{user_sim_cfg.base_url}`",
         f"- persist_type: `{persist_type}`",
         f"- exec_max_turns: `{exec_max_turns}`",
         f"- run_settings: `{json.dumps(run_settings, ensure_ascii=False, sort_keys=True)}`",
@@ -591,8 +941,10 @@ def main() -> int:
     print("[INFO] creating session...")
 
     turns = build_turns()
+    expected_facts = build_expected_facts()
     run_settings = build_run_settings()
     llm_eval_cfg = build_llm_eval_config(cfg)
+    user_sim_cfg = build_user_simulator_config(cfg, llm_eval_cfg)
     persist_type = build_persist_type()
     exec_max_turns = build_exec_max_turns()
     create_settings_json = build_create_settings_json(run_settings)
@@ -603,10 +955,34 @@ def main() -> int:
     print(f"[INFO] run_settings={json.dumps(run_settings, ensure_ascii=False, sort_keys=True)}")
     if create_settings_json:
         print(f"[INFO] create_settings={create_settings_json}")
+    print(f"[INFO] user_simulator_enabled={user_sim_cfg.enabled}")
+    print(f"[INFO] user_simulator_mode={user_sim_cfg.mode}")
+    if user_sim_cfg.enabled:
+        print(f"[INFO] user_simulator_url={user_sim_cfg.base_url}")
+        print(f"[INFO] user_simulator_model={user_sim_cfg.model}")
+        print(f"[INFO] user_simulator_max_turns={user_sim_cfg.max_turns}")
     print(f"[INFO] llm_eval_enabled={llm_eval_cfg.enabled}")
     if llm_eval_cfg.enabled:
         print(f"[INFO] llm_eval_url={llm_eval_cfg.base_url}")
         print(f"[INFO] llm_eval_model={llm_eval_cfg.model}")
+
+    if user_sim_cfg.enabled and (not user_sim_cfg.base_url or not user_sim_cfg.model or not user_sim_cfg.api_key):
+        print("[WARN] user_simulator 配置不完整，回退为固定 5 轮脚本。")
+        user_sim_cfg = UserSimulatorConfig(
+            enabled=False,
+            mode=user_sim_cfg.mode,
+            base_url=user_sim_cfg.base_url,
+            model=user_sim_cfg.model,
+            api_key="",
+            timeout_sec=user_sim_cfg.timeout_sec,
+            max_turns=len(turns),
+            first_user_message=user_sim_cfg.first_user_message,
+            system_prompt=user_sim_cfg.system_prompt,
+            scenario_prompt=user_sim_cfg.scenario_prompt,
+        )
+
+    target_turns = user_sim_cfg.max_turns if user_sim_cfg.enabled else len(turns)
+    sim_state = UserSimulatorState(previous_response_id="")
 
     raw_events_path = result_dir / "raw_events.jsonl"
     with raw_events_path.open("w", encoding="utf-8") as raw_fp:
@@ -620,7 +996,33 @@ def main() -> int:
         print(f"[INFO] create_request_id={create_trace.request_id}")
         print(f"[INFO] create_backend_trace_id={create_trace.backend_trace_id}")
 
-        for idx, user_text in enumerate(turns, start=1):
+        for idx in range(1, target_turns + 1):
+            if idx == 1:
+                user_text = user_sim_cfg.first_user_message if user_sim_cfg.enabled else turns[0]
+            elif user_sim_cfg.enabled:
+                try:
+                    user_text, should_stop, sim_state = generate_user_turn_with_simulator(
+                        sim_cfg=user_sim_cfg,
+                        sim_state=sim_state,
+                        results=results,
+                        expected_facts=expected_facts,
+                        turn_idx=idx,
+                    )
+                    if should_stop:
+                        print(f"[INFO] user_simulator requested stop at turn={idx}")
+                        break
+                except Exception as exc:
+                    print(f"[WARN] user_simulator turn={idx} 生成失败: {exc}")
+                    fallback_idx = idx - 1
+                    if fallback_idx < len(turns):
+                        user_text = turns[fallback_idx]
+                        print(f"[WARN] turn={idx} 使用固定脚本回退。")
+                    else:
+                        print("[WARN] 无可用回退话术，提前结束。")
+                        break
+            else:
+                user_text = turns[idx - 1]
+
             print(f"[INFO] turn={idx}")
             one = execute_turn(
                 base_url=cfg.base_url,
@@ -646,6 +1048,7 @@ def main() -> int:
         cfg,
         session_id,
         run_id,
+        user_sim_cfg,
         persist_type,
         exec_max_turns,
         create_settings_json,
@@ -661,7 +1064,6 @@ def main() -> int:
     )
 
     pass_threshold = _env_float("AUTO_TEST_EVAL_PASS_THRESHOLD", 0.80)
-    expected_facts = build_expected_facts()
     rule_eval = evaluate_rules(results, expected_facts=expected_facts, pass_threshold=pass_threshold)
     llm_eval = evaluate_with_llm(
         results,
