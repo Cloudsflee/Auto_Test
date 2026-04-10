@@ -423,25 +423,37 @@ def evaluate_with_llm(
         }
 
 
-def write_evaluation_md(path: Path, rule_eval: dict[str, Any], llm_eval: dict[str, Any]) -> None:
-    lines: list[str] = [
-        "# 对话评估报告",
-        "",
-        "## Rule Evaluation",
-        "",
-        f"- overall_pass: `{rule_eval.get('overall_pass')}`",
-        f"- overall_score: `{rule_eval.get('overall_score')}`",
-        f"- pass_threshold: `{rule_eval.get('pass_threshold')}`",
-        "",
-        "| check_id | passed | weight | detail |",
-        "| --- | --- | --- | --- |",
-    ]
-    for check in rule_eval.get("checks", []):
-        lines.append(
-            f"| `{check.get('check_id')}` | `{check.get('passed')}` | `{check.get('weight')}` | {check.get('detail') or ''} |"
+def write_evaluation_md(path: Path, rule_eval: dict[str, Any] | None, llm_eval: dict[str, Any]) -> None:
+    lines: list[str] = ["# 对话评估报告", ""]
+    if isinstance(rule_eval, dict) and rule_eval:
+        lines.extend(
+            [
+                "## Rule Evaluation",
+                "",
+                f"- overall_pass: `{rule_eval.get('overall_pass')}`",
+                f"- overall_score: `{rule_eval.get('overall_score')}`",
+                f"- pass_threshold: `{rule_eval.get('pass_threshold')}`",
+                "",
+                "| check_id | passed | weight | detail |",
+                "| --- | --- | --- | --- |",
+            ]
+        )
+        for check in rule_eval.get("checks", []):
+            lines.append(
+                f"| `{check.get('check_id')}` | `{check.get('passed')}` | `{check.get('weight')}` | {check.get('detail') or ''} |"
+            )
+        lines.append("")
+    else:
+        lines.extend(
+            [
+                "## Rule Evaluation",
+                "",
+                "- disabled: `LLM-only mode`",
+                "",
+            ]
         )
 
-    lines.extend(["", "## LLM Evaluation (Optional)", ""])
+    lines.extend(["## LLM Evaluation", ""])
     if not llm_eval.get("enabled"):
         lines.append(f"- skipped: `{llm_eval.get('reason', 'disabled')}`")
     elif llm_eval.get("skipped"):

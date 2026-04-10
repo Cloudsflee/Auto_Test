@@ -6,22 +6,26 @@
     "email": "replace_with_email@example.com"
   },
   "llm_eval": {
-    "enabled": false,
+    "enabled": true,
     "base_url": "https://api.ikuncode.cc/v1/responses",
     "model": "gpt-5.3-codex",
     "api_key": "replace_with_eval_api_key",
     "timeout_sec": 60
   },
   "user_simulator": {
-    "enabled": false,
+    "enabled": true,
     "mode": "provider_context",
     "base_url": "https://api.ikuncode.cc/v1/responses",
     "model": "gpt-5.3-codex",
     "api_key": "replace_with_user_simulator_api_key",
     "timeout_sec": 60,
     "max_turns": 20,
-    "first_user_message": "请清空当前notebook内的所有内容，包括files和workbook。我叫阿龙，我的品牌叫星野咖啡，主打低糖拿铁。请记住这三个信息。",
+    "user_temperature": 0.9,
+    "role_temperature": 1.0,
+    "first_user_message": "请你清空当前notebook内workbook.md 和files.md的内容",
     "system_prompt_file": "user_simulator_system.prompt",
-    "scenario_prompt_file": "user_simulator_scenario.prompt"
+    "scenario_prompt_file": "user_simulator_scenario.prompt",
+    "role_system_prompt_file": "user_simulator_role_system.prompt",
+    "role_user_prompt_file": "user_simulator_role_user.prompt"
   }
 }

@@ -173,35 +173,12 @@ auto_test/results/session_<scenario>_<run_id>/
 ```json
 {
   "generated_at": "2026-04-09T12:00:00",
-  "rule_evaluation": {},
+  "evaluation_mode": "llm_only",
   "llm_evaluation": {}
 }
 ```
 
-## 8.1 规则评估结构（rule_evaluation）
-
-核心字段建议：
-
-- `mode`: `"rule"`
-- `pass_threshold`: 数值阈值
-- `overall_score`: 0~1
-- `overall_pass`: 布尔
-- `critical_failed`: 关键失败项列表
-- `metrics`: 聚合指标（如 total_turns/success_turns）
-- `expected_facts`: 期望硬事实集合
-- `checks`: 逐项检查数组
-
-`checks` 单项建议：
-
-- `check_id`
-- `name`
-- `weight`
-- `passed`
-- `score`
-- `critical`
-- `detail`
-
-## 8.2 LLM 评估结构（llm_evaluation）
+## 8.1 LLM 评估结构（llm_evaluation）
 
 建议兼容三类状态：
 
@@ -221,4 +198,3 @@ auto_test/results/session_<scenario>_<run_id>/
 4. results 产物结构变化
 
 其余测试策略、脚本命名、运行入口、目录说明等，请在 `auto_test/README.md` 维护。
-

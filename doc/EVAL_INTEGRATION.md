@@ -20,42 +20,45 @@
 
 ---
 
-## 3. 默认规则评估（必选）
+## 3. 当前模式：LLM-only（必选）
 
-当前基线规则：
+当前默认模式为 LLM-only，不再依赖固定规则评分与固定事实集。
 
-- `run_success`：轮次完成且无 `RUN_ERROR`
-- `non_empty_response`：助手回复非空
-- `no_tool_leak`：用户可见文本不泄漏工具载荷
-- `memory_recall_turn4`：指定轮次记忆召回
-- `summary_coverage_turn5`：总结轮次覆盖关键事实
+要求：
 
-评分方式：
+- 必须启用并配置 `llm_eval`
+- 评估结论来自 `llm_evaluation` 字段
+- `evaluation_mode` 为 `llm_only`
 
-- 加权得分区间 `[0, 1]`
-- 默认通过阈值：`0.80`
-- 可通过环境变量覆盖：`AUTO_TEST_EVAL_PASS_THRESHOLD`
+关键配置（推荐写入 `config/*.json`）：
 
----
-
-## 4. 可选 LLM 评估（增强）
-
-默认关闭，可通过环境变量开启：
-
-- `AUTO_TEST_ENABLE_LLM_EVAL=true`
-- `AUTO_TEST_EVAL_LLM_URL=...`
-- `AUTO_TEST_EVAL_LLM_MODEL=...`
-- `AUTO_TEST_EVAL_LLM_API_KEY=...`
-- `AUTO_TEST_EVAL_LLM_TIMEOUT_SEC=30`（可选）
-
-启用后，LLM 评估结果应写入：
-
-- `non_text/evaluation.json`
-- `evaluation.md`
+- `llm_eval.enabled=true`
+- `llm_eval.base_url=...`
+- `llm_eval.model=...`
+- `llm_eval.api_key=...`
+- `llm_eval.timeout_sec=...`
 
 ---
 
-## 5. 记忆/压缩专项扩展建议
+## 4. 用户模拟器（推荐）
+
+测试执行阶段建议启用 `user_simulator`（默认 `provider_context`）生成多样化用户输入：
+
+- `user_simulator.enabled=true`
+- `user_simulator.mode=provider_context`
+- `user_simulator.base_url=...`
+- `user_simulator.model=...`
+- `user_simulator.api_key=...`
+- `user_simulator.max_turns=...`
+
+提示词建议放在：
+
+- `prompts/user_simulator_system.prompt`
+- `prompts/user_simulator_scenario.prompt`
+
+---
+
+## 5. 记忆/压缩专项扩展建议（保留）
 
 建议在当前 smoke 评估基础上增加：
 
@@ -75,4 +78,3 @@
 - 压缩前后 token 大小
 - 摘要版本或摘要 ID
 - 保留/丢弃事实标识
-

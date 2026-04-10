@@ -17,7 +17,7 @@ auto_test/
   doc/                           # 稳定契约与规范
   src/                           # 测试与评估代码
     tests/
-      run_5turn_session_test.py  # 5轮 smoke 测试执行入口
+      run_5turn_session_test.py  # 多轮 session 测试执行入口（历史文件名保留）
     eval/
       dialogue_evaluator.py      # 规则/LLM 评估实现
     README.md
@@ -51,7 +51,7 @@ auto_test/
 ## 4. 代码组织约定
 
 - `src/tests/`：负责“发请求、跑场景、收集原始结果、落盘”
-- `src/eval/`：负责“规则评估、可选 LLM 评估、评估报告输出”
+- `src/eval/`：负责“LLM 评估、评估报告输出”
 - `prompts/`：评估提示词模板，不写死在代码里
 
 建议后续新增场景时保持：
@@ -71,6 +71,12 @@ auto_test/
 python src/tests/run_5turn_session_test.py
 ```
 
+- 临时调轮次（不改配置）：
+
+```bash
+python src/tests/run_5turn_session_test.py --max-turns 30
+```
+
 - 配置加载优先级（高 -> 低）：
   1. `config/config.local.json`
   2. `config/config.json`
@@ -81,14 +87,15 @@ python src/tests/run_5turn_session_test.py
 
 - 仓库默认提供 `config/config.example.json` 作为模板。
 - `test.txt` / `test_re.txt` 为兼容历史格式，仓库内默认不提供示例文件。
-- 评估 LLM 的接口信息建议写入 `config/*.json` 的 `llm_eval` 字段（`enabled/base_url/model/api_key/timeout_sec`）。
-- 若需“模型扮演客户”驱动测试，配置 `user_simulator` 字段（默认模式 `provider_context`），提示词模板放在 `prompts/user_simulator_*.prompt`。
+- 测试已切换为 LLM-only：`llm_eval` 与 `user_simulator` 需要在 `config/*.json` 中配置。
+- “模型扮演客户”由 `user_simulator` 驱动（默认模式 `provider_context`），每次测试 run 开始前先随机生成客户角色，再进入正式对话流程。
+- 提示词模板放在 `prompts/user_simulator_*.prompt`（含角色生成与扮演提示词）。
 
 ---
 
 ## 6. 结果产物
 
-每次运行会创建独立目录：`results/session_5turn_<run_id>/`，包含：
+每次运行会创建独立目录：`results/session_autotest_<run_id>/`，包含：
 
 - `run_meta.md`
 - `dialogue.md`
