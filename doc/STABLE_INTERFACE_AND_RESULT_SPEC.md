@@ -131,7 +131,7 @@ auto_test/results/session_<scenario>_<run_id>/
     _manifest.json
     README.md
     ... exported workspace files ...
-  non_text/
+  run_data/
     turn_results.json
     evaluation.json
     README.md

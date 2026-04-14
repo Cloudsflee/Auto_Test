@@ -2086,7 +2086,7 @@ def main() -> int:
 
     run_id = f"{now_stamp()}_{uuid.uuid4().hex[:8]}"
     result_dir = AUTO_TEST_DIR / "results" / f"session_autotest_{run_id}"
-    non_text_dir = result_dir / "non_text"
+    run_data_dir = result_dir / "run_data"
 
     headers = {
         "Authorization": normalize_authz(cfg.token),
@@ -2143,7 +2143,7 @@ def main() -> int:
         raise RuntimeError("llm_eval 配置不完整：需要 base_url/model/api_key。")
 
     result_dir.mkdir(parents=True, exist_ok=True)
-    non_text_dir.mkdir(parents=True, exist_ok=True)
+    run_data_dir.mkdir(parents=True, exist_ok=True)
 
     target_turns = user_sim_cfg.max_turns
     # Generate role in an isolated call, then start a fresh simulator dialogue context.
@@ -2253,7 +2253,7 @@ def main() -> int:
     )
     write_dialogue_md(result_dir / "dialogue.md", results)
 
-    (non_text_dir / "turn_results.json").write_text(
+    (run_data_dir / "turn_results.json").write_text(
         json.dumps(results, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
@@ -2267,7 +2267,7 @@ def main() -> int:
     if llm_eval.get("skipped") or llm_eval.get("error"):
         raise RuntimeError(f"LLM 评估失败: {llm_eval.get('reason') or llm_eval.get('error')}")
 
-    (non_text_dir / "evaluation.json").write_text(
+    (run_data_dir / "evaluation.json").write_text(
         json.dumps(
             {
                 "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -2282,8 +2282,8 @@ def main() -> int:
     )
     write_evaluation_md(result_dir / "evaluation.md", rule_eval=None, llm_eval=llm_eval)
 
-    (non_text_dir / "README.md").write_text(
-        "# non_text 结构说明\n\n"
+    (run_data_dir / "README.md").write_text(
+        "# run_data 结构说明\n\n"
         "- `turn_results.json`: 每轮结构化结果。\n"
         "- `evaluation.json`: LLM-only 评估结果。\n"
         "- `../workspace/`: 用户可见工作区导出（含 `_manifest.json` 与文件落盘结果）。\n",

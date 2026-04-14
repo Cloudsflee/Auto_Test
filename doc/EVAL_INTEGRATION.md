@@ -11,7 +11,7 @@
 每次测试建议至少输出：
 
 - 文本报告：`evaluation.md`
-- 结构化结果：`non_text/evaluation.json`
+- 结构化结果：`run_data/evaluation.json`
 
 其中：
 

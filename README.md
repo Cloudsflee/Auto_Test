@@ -101,8 +101,8 @@ python src/tests/run_5turn_session_test.py --max-turns 30
 - `dialogue.md`
 - `evaluation.md`
 - `raw_events.jsonl`
-- `non_text/turn_results.json`
-- `non_text/evaluation.json`
+- `run_data/turn_results.json`
+- `run_data/evaluation.json`
 - `workspace/`（用户可见工作区导出，含 `_manifest.json`、导出的 md 与图片引用/文件）
 
 说明：
