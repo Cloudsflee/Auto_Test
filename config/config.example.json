@@ -1,6 +1,11 @@
 {
   "base_url": "http://your-backend.example.com",
   "dotai_base_url": "http://your-dotai-backend.example.com",
+  "proxy": {
+    "http": "http://127.0.0.1:7890",
+    "https": "http://127.0.0.1:7890",
+    "no_proxy": ""
+  },
   "auth": {
     "token": "Bearer replace_with_your_token",
     "uid": "replace_with_uid",

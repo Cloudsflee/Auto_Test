@@ -22,6 +22,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from eval.dialogue_evaluator import LLMEvalConfig, evaluate_with_llm, write_evaluation_md
+from probe import evaluate_probes, write_probe_evaluation_md
 from tests.user_simulator_engine import (
     GeneratedRole,
     UserSimulatorConfig,
@@ -49,6 +50,9 @@ CFG_PATH_CANDIDATES = [
 class AuthConfig:
     base_url: str
     dotai_base_url: str
+    proxy_http: str
+    proxy_https: str
+    proxy_no_proxy: str
     token: str
     uid: str
     email: str
@@ -64,6 +68,14 @@ class TraceInfo:
     tracestate: str
     x_trace_id: str
     backend_trace_id: str
+
+
+@dataclass
+class ProbeEvalConfig:
+    enabled: bool
+    dataset_path: Path
+    fail_on_error: bool
+    max_fail_details: int
 
 
 REQUIRED_NOTEBOOK_CLEAR_TEXT = "请你把当前记忆文件重置为系统初始模板"
@@ -231,6 +243,26 @@ def _load_json_config(path: Path) -> AuthConfig:
 
     base_url = str(obj.get("base_url", "")).strip().rstrip("/")
     dotai_base_url = str(obj.get("dotai_base_url", "")).strip().rstrip("/")
+    proxy = obj.get("proxy")
+    if not isinstance(proxy, dict):
+        proxy = {}
+    proxy_http = str(
+        proxy.get("http")
+        or proxy.get("http_proxy")
+        or obj.get("http_proxy")
+        or ""
+    ).strip()
+    proxy_https = str(
+        proxy.get("https")
+        or proxy.get("https_proxy")
+        or obj.get("https_proxy")
+        or ""
+    ).strip()
+    proxy_no_proxy = str(
+        proxy.get("no_proxy")
+        or obj.get("no_proxy")
+        or ""
+    ).strip()
     token = str(auth.get("token", "") or obj.get("token", "")).strip()
     uid = str(auth.get("uid", "") or obj.get("uid", "")).strip()
     email = str(auth.get("email", "") or obj.get("email", "")).strip()
@@ -247,6 +279,9 @@ def _load_json_config(path: Path) -> AuthConfig:
     return AuthConfig(
         base_url=base_url,
         dotai_base_url=dotai_base_url,
+        proxy_http=proxy_http,
+        proxy_https=proxy_https,
+        proxy_no_proxy=proxy_no_proxy,
         token=token,
         uid=uid,
         email=email,
@@ -260,6 +295,9 @@ def _load_text_config(path: Path) -> AuthConfig:
     text = path.read_text(encoding="utf-8", errors="ignore")
     base_url = _pick_text_value(text, "base_url").rstrip("/")
     dotai_base_url = _pick_text_value(text, "dotai_base_url").rstrip("/")
+    proxy_http = _pick_text_value(text, "http_proxy")
+    proxy_https = _pick_text_value(text, "https_proxy")
+    proxy_no_proxy = _pick_text_value(text, "no_proxy")
     token = _pick_text_value(text, "token")
     uid = _pick_text_value(text, "uid")
     email = _pick_text_value(text, "email")
@@ -268,6 +306,9 @@ def _load_text_config(path: Path) -> AuthConfig:
     return AuthConfig(
         base_url=base_url,
         dotai_base_url=dotai_base_url,
+        proxy_http=proxy_http,
+        proxy_https=proxy_https,
+        proxy_no_proxy=proxy_no_proxy,
         token=token,
         uid=uid,
         email=email,
@@ -319,6 +360,37 @@ def resolve_dotai_base_url(cfg: AuthConfig) -> str:
     if cfg.dotai_base_url:
         return cfg.dotai_base_url.rstrip("/")
     return _derive_dotai_base_url(cfg.base_url)
+
+
+def apply_proxy_from_config(cfg: AuthConfig) -> dict[str, str]:
+    # Env vars keep higher priority; config acts as default fallback.
+    applied: dict[str, str] = {}
+    http_proxy = str(cfg.proxy_http or "").strip()
+    https_proxy = str(cfg.proxy_https or "").strip()
+    no_proxy = str(cfg.proxy_no_proxy or "").strip()
+
+    if http_proxy and not os.getenv("HTTP_PROXY"):
+        os.environ["HTTP_PROXY"] = http_proxy
+        applied["HTTP_PROXY"] = http_proxy
+    if http_proxy and not os.getenv("http_proxy"):
+        os.environ["http_proxy"] = http_proxy
+        applied["http_proxy"] = http_proxy
+
+    if https_proxy and not os.getenv("HTTPS_PROXY"):
+        os.environ["HTTPS_PROXY"] = https_proxy
+        applied["HTTPS_PROXY"] = https_proxy
+    if https_proxy and not os.getenv("https_proxy"):
+        os.environ["https_proxy"] = https_proxy
+        applied["https_proxy"] = https_proxy
+
+    if no_proxy and not os.getenv("NO_PROXY"):
+        os.environ["NO_PROXY"] = no_proxy
+        applied["NO_PROXY"] = no_proxy
+    if no_proxy and not os.getenv("no_proxy"):
+        os.environ["no_proxy"] = no_proxy
+        applied["no_proxy"] = no_proxy
+
+    return applied
 
 
 def mask_token(token: str) -> str:
@@ -933,6 +1005,22 @@ def build_expected_facts() -> dict[str, str]:
     return {}
 
 
+def build_probe_eval_config() -> ProbeEvalConfig:
+    enabled = _env_bool("AUTO_TEST_ENABLE_PROBE_EVAL", False)
+    default_rel = Path("datasets") / "probes" / "clinic_memory_v1.json"
+    raw_dataset = str(os.getenv("AUTO_TEST_PROBE_DATASET_PATH", "")).strip()
+    dataset_path = (AUTO_TEST_DIR / default_rel).resolve()
+    if raw_dataset:
+        custom = Path(raw_dataset)
+        dataset_path = custom if custom.is_absolute() else (AUTO_TEST_DIR / custom).resolve()
+    return ProbeEvalConfig(
+        enabled=enabled,
+        dataset_path=dataset_path,
+        fail_on_error=_env_bool("AUTO_TEST_PROBE_FAIL_ON_DATASET_ERROR", True),
+        max_fail_details=max(1, min(100, _env_int("AUTO_TEST_PROBE_MAX_FAIL_DETAILS", 20))),
+    )
+
+
 def write_meta_md(
     path: Path,
     cfg: AuthConfig,
@@ -947,6 +1035,7 @@ def write_meta_md(
     create_trace: TraceInfo,
     results: list[dict[str, Any]],
     workspace_export: dict[str, Any] | None = None,
+    probe_eval: dict[str, Any] | None = None,
 ) -> None:
     ok_turns = sum(1 for r in results if r.get("run_end") and not r.get("run_error"))
     lines = [
@@ -955,6 +1044,9 @@ def write_meta_md(
         f"- run_id: `{run_id}`",
         f"- session_id: `{session_id}`",
         f"- base_url: `{cfg.base_url}`",
+        f"- proxy_http: `{cfg.proxy_http or ''}`",
+        f"- proxy_https: `{cfg.proxy_https or ''}`",
+        f"- proxy_no_proxy: `{cfg.proxy_no_proxy or ''}`",
         f"- uid: `{cfg.uid}`",
         f"- email: `{cfg.email}`",
         f"- token(masked): `{mask_token(cfg.token)}`",
@@ -1026,6 +1118,23 @@ def write_meta_md(
                 f"- unresolved_files: `{counts.get('unresolved_files', 0)}`",
             ]
         )
+    if isinstance(probe_eval, dict):
+        summary = probe_eval.get("summary")
+        if isinstance(summary, dict):
+            lines.extend(
+                [
+                    "",
+                    "## Probe Evaluation",
+                    "",
+                    f"- dataset_id: `{summary.get('dataset_id', '')}`",
+                    f"- dataset_version: `{summary.get('dataset_version', '')}`",
+                    f"- total_probes: `{summary.get('total_probes', 0)}`",
+                    f"- passed_probes: `{summary.get('passed_probes', 0)}`",
+                    f"- failed_probes: `{summary.get('failed_probes', 0)}`",
+                    f"- weighted_score: `{summary.get('weighted_score', 0)}`",
+                    f"- critical_failed: `{summary.get('critical_failed', [])}`",
+                ]
+            )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -1049,6 +1158,7 @@ def main() -> int:
     args = parse_runtime_args(sys.argv[1:])
     cfg_path = resolve_config_path()
     cfg = load_config(cfg_path)
+    applied_proxy = apply_proxy_from_config(cfg)
     dotai_base_url = resolve_dotai_base_url(cfg)
     print(f"[INFO] config_path={cfg.source_path.as_posix()}")
 
@@ -1066,11 +1176,16 @@ def main() -> int:
     print(f"[INFO] run_id={run_id}")
     print(f"[INFO] result_dir={result_dir.as_posix()}")
     print(f"[INFO] dotai_base_url={dotai_base_url or '(disabled)'}")
+    if applied_proxy:
+        print(f"[INFO] proxy_from_config={json.dumps(applied_proxy, ensure_ascii=False)}")
+    else:
+        print("[INFO] proxy_from_config=(none)")
     print("[INFO] creating session...")
 
     expected_facts = build_expected_facts()
     run_settings = build_run_settings()
     llm_eval_cfg = build_llm_eval_config(cfg)
+    probe_eval_cfg = build_probe_eval_config()
     user_sim_cfg = build_user_simulator_config(cfg, llm_eval_cfg)
     persist_type = build_persist_type()
     exec_max_turns = build_exec_max_turns()
@@ -1096,6 +1211,8 @@ def main() -> int:
     if llm_eval_cfg.enabled:
         print(f"[INFO] llm_eval_url={llm_eval_cfg.base_url}")
         print(f"[INFO] llm_eval_model={llm_eval_cfg.model}")
+    print(f"[INFO] probe_eval_enabled={probe_eval_cfg.enabled}")
+    print(f"[INFO] probe_eval_dataset={probe_eval_cfg.dataset_path.as_posix()}")
 
     if args.max_turns > 0:
         user_sim_cfg.max_turns = max(1, min(128, args.max_turns))
@@ -1204,6 +1321,53 @@ def main() -> int:
             f"unresolved={workspace_counts.get('unresolved_files', 0)}"
         )
 
+    (run_data_dir / "turn_results.json").write_text(
+        json.dumps(results, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+
+    probe_eval_payload: dict[str, Any] | None = None
+    if probe_eval_cfg.enabled:
+        try:
+            probe_eval_payload = evaluate_probes(
+                dataset_path=probe_eval_cfg.dataset_path,
+                turn_results_path=run_data_dir / "turn_results.json",
+                workspace_manifest_path=result_dir / "workspace" / "_manifest.json",
+                raw_events_path=raw_events_path,
+            )
+            (run_data_dir / "probe_results.json").write_text(
+                json.dumps(probe_eval_payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            write_probe_evaluation_md(
+                result_dir / "probe_evaluation.md",
+                probe_eval_payload,
+                max_fail_details=probe_eval_cfg.max_fail_details,
+            )
+            summary = probe_eval_payload.get("summary")
+            if isinstance(summary, dict):
+                print(
+                    "[INFO] probe_eval "
+                    f"total={summary.get('total_probes', 0)} "
+                    f"passed={summary.get('passed_probes', 0)} "
+                    f"failed={summary.get('failed_probes', 0)} "
+                    f"score={summary.get('weighted_score', 0)}"
+                )
+        except Exception as exc:
+            if probe_eval_cfg.fail_on_error:
+                raise RuntimeError(f"probe evaluation failed: {exc}") from exc
+            probe_eval_payload = {
+                "generated_at": datetime.now().isoformat(timespec="seconds"),
+                "skipped": True,
+                "error": str(exc),
+                "dataset_path": probe_eval_cfg.dataset_path.as_posix(),
+            }
+            (run_data_dir / "probe_results.json").write_text(
+                json.dumps(probe_eval_payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            print(f"[WARN] probe evaluation skipped due to error: {exc}")
+
     write_meta_md(
         result_dir / "run_meta.md",
         cfg,
@@ -1218,13 +1382,9 @@ def main() -> int:
         create_trace,
         results,
         workspace_export=workspace_export,
+        probe_eval=probe_eval_payload,
     )
     write_dialogue_md(result_dir / "dialogue.md", results)
-
-    (run_data_dir / "turn_results.json").write_text(
-        json.dumps(results, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
 
     llm_eval = evaluate_with_llm(
         results,
@@ -1254,6 +1414,7 @@ def main() -> int:
         "# run_data 结构说明\n\n"
         "- `turn_results.json`: 每轮结构化结果。\n"
         "- `evaluation.json`: LLM-only 评估结果。\n"
+        "- `probe_results.json`: 探针评估结构化结果（启用 `AUTO_TEST_ENABLE_PROBE_EVAL=true` 时生成）。\n"
         "- `../workspace/`: 用户可见工作区导出（含 `_manifest.json` 与文件落盘结果）。\n",
         encoding="utf-8",
     )

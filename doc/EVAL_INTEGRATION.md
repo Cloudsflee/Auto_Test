@@ -12,6 +12,7 @@
 
 - 文本报告：`evaluation.md`
 - 结构化结果：`run_data/evaluation.json`
+- 探针结构化结果（可选）：`run_data/probe_results.json`
 
 其中：
 

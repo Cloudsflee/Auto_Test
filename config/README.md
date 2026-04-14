@@ -16,6 +16,9 @@
 ## 字段说明
 
 - `base_url`: 后端基地址（不带末尾 `/` 更稳妥）
+- `proxy.http`: 可选 HTTP 代理地址（如 `http://127.0.0.1:7890`）
+- `proxy.https`: 可选 HTTPS 代理地址（如 `http://127.0.0.1:7890`）
+- `proxy.no_proxy`: 可选 NO_PROXY（逗号分隔）
 - `auth.token`: `Bearer xxx` 或 raw token（代码会自动补 Bearer）
 - `auth.uid`: 用户 ID
 - `auth.email`: 用户邮箱
@@ -47,6 +50,8 @@
 说明：
 
 - 当前测试已切换为 LLM-only：必须配置并启用 `llm_eval` 与 `user_simulator`。
+- 代理可直接在配置中声明（`proxy.http/proxy.https/proxy.no_proxy`）；代码会在运行时自动写入环境变量。
+- 环境变量若已存在（如 `HTTP_PROXY`），会优先于配置中的代理值。
 - LLM 评估优先读取 `llm_eval` 配置；未配置字段会回退到环境变量。
 - 兼容环境变量：`AUTO_TEST_ENABLE_LLM_EVAL`、`AUTO_TEST_EVAL_LLM_URL`、`AUTO_TEST_EVAL_LLM_MODEL`、`AUTO_TEST_EVAL_LLM_API_KEY`、`AUTO_TEST_EVAL_LLM_TIMEOUT_SEC`。
 - 用户模拟优先读取 `user_simulator` 配置；未配置字段会回退到 `AUTO_TEST_USER_SIM_*` 环境变量，最后回退到 `llm_eval` 同名字段。
@@ -99,3 +104,19 @@
 - Workspace file export order:
   1. `files/session` API
   2. DotAI FS `POST /dotai/fs/stat` + `POST /dotai/fs/download`
+
+---
+
+## Probe Evaluation (Phase 1)
+
+- Enable deterministic probe evaluation:
+  - `AUTO_TEST_ENABLE_PROBE_EVAL=true`
+- Optional dataset path override:
+  - `AUTO_TEST_PROBE_DATASET_PATH=datasets/probes/clinic_memory_v1.json`
+- Error strategy:
+  - `AUTO_TEST_PROBE_FAIL_ON_DATASET_ERROR=true|false` (default `true`)
+- Markdown failure detail cap:
+  - `AUTO_TEST_PROBE_MAX_FAIL_DETAILS` (default `20`)
+- Outputs when enabled:
+  - `results/<run>/run_data/probe_results.json`
+  - `results/<run>/probe_evaluation.md`

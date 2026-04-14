@@ -6,6 +6,7 @@
 src/
   tests/   # 测试执行代码（发请求、跑场景、收集结果、落盘）
   eval/    # 评估代码（规则评估、LLM评估、评估报告）
+  probe/   # 探针评估代码（数据集加载、确定性断言、汇总报告）
 ```
 
 ---
@@ -34,7 +35,18 @@ src/
 
 ---
 
-## 4. 扩展建议
+## 4. probe 目录
+
+- `probe/evaluator.py`
+  - 作用：执行 Phase 1 探针评估（确定性）
+  - 职责：
+    1. 读取探针数据集
+    2. 从 `turn_results.json` 与 `workspace/_manifest.json` 构建上下文
+    3. 执行断言并输出 `probe_results.json` 与 `probe_evaluation.md`
+
+---
+
+## 5. 扩展建议
 
 后续如果新增长会话测试，可继续在 `tests/` 下增加：
 
@@ -43,4 +55,3 @@ src/
 - `run_compression_checkpoint_test.py`
 
 并尽量复用 `eval/dialogue_evaluator.py`，避免评估逻辑分散。
-

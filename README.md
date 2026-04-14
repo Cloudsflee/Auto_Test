@@ -103,11 +103,20 @@ python src/tests/run_5turn_session_test.py --max-turns 30
 - `raw_events.jsonl`
 - `run_data/turn_results.json`
 - `run_data/evaluation.json`
+- `run_data/probe_results.json`（启用探针评估时生成）
 - `workspace/`（用户可见工作区导出，含 `_manifest.json`、导出的 md 与图片引用/文件）
+
+探针评估（Phase 1，确定性）：
+- 开启：`AUTO_TEST_ENABLE_PROBE_EVAL=true`
+- 数据集路径（可选）：`AUTO_TEST_PROBE_DATASET_PATH=datasets/probes/clinic_memory_v1.json`
+- 产物：
+  - `run_data/probe_results.json`
+  - `probe_evaluation.md`
 
 说明：
 - 工作区文件导出会优先尝试 `files/session` API；若图片/二进制在该链路不可下载，会自动回退到 DotAI FS（`/dotai/fs/stat` + `/dotai/fs/download`）。
 - 可通过 `config.dotai_base_url` 或环境变量 `AUTO_TEST_DOTAI_BASE_URL` 指定 DotAI 后端地址。
+- 可通过 `config.proxy` 设置代理（如 `127.0.0.1:7890`），运行时自动应用到 `HTTP_PROXY/HTTPS_PROXY`。
 
 ---
 

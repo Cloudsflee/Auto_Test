@@ -1,0 +1,390 @@
+{
+  "dataset_id": "clinic_memory_v1",
+  "dataset_version": "1.0.0",
+  "description": "Phase1 deterministic probes for memory/compression baseline",
+  "owner": "auto_test",
+  "probes": [
+    {
+      "probe_id": "recall_first_user_reset_phrase",
+      "probe_type": "recall",
+      "judge_mode": "deterministic",
+      "priority": "high",
+      "weight": 1.0,
+      "critical": true,
+      "target": {
+        "source": "turn_user_text",
+        "turn": 1
+      },
+      "assertions": [
+        {
+          "assert_type": "contains_all",
+          "expect": [
+            "请你把当前记忆文件重置为系统初始模板"
+          ]
+        }
+      ],
+      "description": "首轮用户输入必须包含固定重置指令"
+    },
+    {
+      "probe_id": "recall_first_assistant_non_empty",
+      "probe_type": "recall",
+      "judge_mode": "deterministic",
+      "priority": "high",
+      "weight": 1.0,
+      "critical": true,
+      "target": {
+        "source": "turn_assistant_text",
+        "turn": 1
+      },
+      "assertions": [
+        {
+          "assert_type": "non_empty"
+        }
+      ],
+      "description": "首轮助手回复应非空"
+    },
+    {
+      "probe_id": "recall_first_turn_run_end_true",
+      "probe_type": "recall",
+      "judge_mode": "deterministic",
+      "priority": "high",
+      "weight": 1.0,
+      "critical": true,
+      "target": {
+        "source": "turn_object",
+        "turn": 1
+      },
+      "assertions": [
+        {
+          "assert_type": "bool_field_true",
+          "expect": {
+            "field": "run_end",
+            "value": true
+          }
+        }
+      ],
+      "description": "首轮应正常结束"
+    },
+    {
+      "probe_id": "recall_first_turn_no_error",
+      "probe_type": "recall",
+      "judge_mode": "deterministic",
+      "priority": "high",
+      "weight": 1.0,
+      "critical": true,
+      "target": {
+        "source": "turn_object",
+        "turn": 1
+      },
+      "assertions": [
+        {
+          "assert_type": "json_field_equals",
+          "expect": {
+            "field": "run_error",
+            "value": ""
+          }
+        }
+      ],
+      "description": "首轮不应有 run_error"
+    },
+    {
+      "probe_id": "continuation_total_turns_gte_1",
+      "probe_type": "continuation",
+      "judge_mode": "deterministic",
+      "weight": 0.8,
+      "target": {
+        "source": "global_summary"
+      },
+      "assertions": [
+        {
+          "assert_type": "numeric_field_gte",
+          "expect": {
+            "field": "total_turns",
+            "gte": 1
+          }
+        }
+      ],
+      "description": "全局轮次数应至少为 1"
+    },
+    {
+      "probe_id": "continuation_success_turns_gte_1",
+      "probe_type": "continuation",
+      "judge_mode": "deterministic",
+      "weight": 1.0,
+      "target": {
+        "source": "global_summary"
+      },
+      "assertions": [
+        {
+          "assert_type": "numeric_field_gte",
+          "expect": {
+            "field": "success_turns",
+            "gte": 1
+          }
+        }
+      ],
+      "description": "至少应有一轮成功执行"
+    },
+    {
+      "probe_id": "continuation_any_run_error_false",
+      "probe_type": "continuation",
+      "judge_mode": "deterministic",
+      "weight": 1.0,
+      "target": {
+        "source": "global_summary"
+      },
+      "assertions": [
+        {
+          "assert_type": "json_field_equals",
+          "expect": {
+            "field": "any_run_error",
+            "value": false
+          }
+        }
+      ],
+      "description": "全局不应出现 run_error（若失败用于定位稳定性问题）"
+    },
+    {
+      "probe_id": "decision_first_user_no_tool_payload",
+      "probe_type": "decision",
+      "judge_mode": "deterministic",
+      "weight": 0.8,
+      "target": {
+        "source": "turn_user_text",
+        "turn": 1
+      },
+      "assertions": [
+        {
+          "assert_type": "not_contains_any",
+          "expect": [
+            "<tool>",
+            "\"tool_name\"",
+            "\"tool_input\""
+          ]
+        }
+      ],
+      "description": "首轮用户文本不应包含工具载荷"
+    },
+    {
+      "probe_id": "decision_first_assistant_no_tool_payload",
+      "probe_type": "decision",
+      "judge_mode": "deterministic",
+      "weight": 0.8,
+      "target": {
+        "source": "turn_assistant_text",
+        "turn": 1
+      },
+      "assertions": [
+        {
+          "assert_type": "not_contains_any",
+          "expect": [
+            "<tool>",
+            "\"tool_name\"",
+            "\"tool_input\""
+          ]
+        }
+      ],
+      "description": "首轮助手可见文本不应包含工具载荷"
+    },
+    {
+      "probe_id": "artifact_workspace_manifest_session_id_non_empty",
+      "probe_type": "artifact",
+      "judge_mode": "deterministic",
+      "weight": 1.0,
+      "critical": true,
+      "target": {
+        "source": "workspace_manifest"
+      },
+      "assertions": [
+        {
+          "assert_type": "json_field_non_empty",
+          "field": "session_id"
+        }
+      ],
+      "description": "workspace manifest 必须包含 session_id"
+    },
+    {
+      "probe_id": "artifact_workspace_manifest_counts_exists",
+      "probe_type": "artifact",
+      "judge_mode": "deterministic",
+      "weight": 0.8,
+      "target": {
+        "source": "workspace_manifest"
+      },
+      "assertions": [
+        {
+          "assert_type": "json_field_non_empty",
+          "field": "counts"
+        }
+      ],
+      "description": "workspace manifest 必须包含 counts"
+    },
+    {
+      "probe_id": "artifact_workspace_all_paths_non_negative",
+      "probe_type": "artifact",
+      "judge_mode": "deterministic",
+      "weight": 0.8,
+      "target": {
+        "source": "workspace_manifest"
+      },
+      "assertions": [
+        {
+          "assert_type": "numeric_field_gte",
+          "expect": {
+            "field": "counts.all_paths",
+            "gte": 0
+          }
+        }
+      ],
+      "description": "all_paths 计数应为非负值"
+    },
+    {
+      "probe_id": "artifact_exported_text_non_negative",
+      "probe_type": "artifact",
+      "judge_mode": "deterministic",
+      "weight": 0.8,
+      "target": {
+        "source": "workspace_manifest"
+      },
+      "assertions": [
+        {
+          "assert_type": "numeric_field_gte",
+          "expect": {
+            "field": "counts.exported_text_files",
+            "gte": 0
+          }
+        }
+      ],
+      "description": "导出文本文件计数应为非负值"
+    },
+    {
+      "probe_id": "artifact_exported_image_non_negative",
+      "probe_type": "artifact",
+      "judge_mode": "deterministic",
+      "weight": 0.8,
+      "target": {
+        "source": "workspace_manifest"
+      },
+      "assertions": [
+        {
+          "assert_type": "numeric_field_gte",
+          "expect": {
+            "field": "counts.exported_image_files",
+            "gte": 0
+          }
+        }
+      ],
+      "description": "导出图片文件计数应为非负值"
+    },
+    {
+      "probe_id": "artifact_unresolved_files_zero",
+      "probe_type": "artifact",
+      "judge_mode": "deterministic",
+      "weight": 1.0,
+      "target": {
+        "source": "workspace_manifest"
+      },
+      "assertions": [
+        {
+          "assert_type": "json_field_equals",
+          "expect": {
+            "field": "counts.unresolved_files",
+            "value": 0
+          }
+        }
+      ],
+      "description": "未解析文件数量应为 0"
+    },
+    {
+      "probe_id": "artifact_workspace_paths_prefix_valid",
+      "probe_type": "artifact",
+      "judge_mode": "deterministic",
+      "weight": 0.6,
+      "target": {
+        "source": "workspace_paths"
+      },
+      "assertions": [
+        {
+          "assert_type": "list_contains_path_pattern",
+          "expect": [
+            "^/workspace/"
+          ]
+        }
+      ],
+      "description": "工作区路径列表应符合 /workspace/ 前缀"
+    },
+    {
+      "probe_id": "artifact_workspace_has_workbook_md",
+      "probe_type": "artifact",
+      "judge_mode": "deterministic",
+      "weight": 0.9,
+      "target": {
+        "source": "workspace_paths"
+      },
+      "assertions": [
+        {
+          "assert_type": "file_exists",
+          "expect": "/workspace/advoo/workbook.md"
+        }
+      ],
+      "description": "工作区应包含 workbook.md"
+    },
+    {
+      "probe_id": "artifact_workspace_has_files_md",
+      "probe_type": "artifact",
+      "judge_mode": "deterministic",
+      "weight": 0.9,
+      "target": {
+        "source": "workspace_paths"
+      },
+      "assertions": [
+        {
+          "assert_type": "file_exists",
+          "expect": "/workspace/advoo/files.md"
+        }
+      ],
+      "description": "工作区应包含 files.md"
+    },
+    {
+      "probe_id": "artifact_image_ext_count_non_negative",
+      "probe_type": "artifact",
+      "judge_mode": "deterministic",
+      "weight": 0.6,
+      "target": {
+        "source": "workspace_paths"
+      },
+      "assertions": [
+        {
+          "assert_type": "file_ext_count_gte",
+          "expect": {
+            "ext": [
+              "png",
+              "jpg",
+              "jpeg",
+              "webp",
+              "gif",
+              "bmp"
+            ],
+            "gte": 0
+          }
+        }
+      ],
+      "description": "图片后缀计数应为非负值"
+    },
+    {
+      "probe_id": "continuation_turn_results_non_empty",
+      "probe_type": "continuation",
+      "judge_mode": "deterministic",
+      "weight": 0.8,
+      "target": {
+        "source": "turn_results"
+      },
+      "assertions": [
+        {
+          "assert_type": "non_empty"
+        }
+      ],
+      "description": "turn_results 结果集应非空"
+    }
+  ]
+}

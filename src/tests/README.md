@@ -16,6 +16,10 @@
   - 先走 `files/session` API
   - 失败后走 DotAI FS（`/dotai/fs/stat` + `/dotai/fs/download`）
 - DotAI 地址可通过 `config.dotai_base_url` 或环境变量 `AUTO_TEST_DOTAI_BASE_URL` 指定。
+- 探针评估（Phase 1，确定性）可通过环境变量开启：
+  - `AUTO_TEST_ENABLE_PROBE_EVAL=true`
+  - 可选：`AUTO_TEST_PROBE_DATASET_PATH=datasets/probes/clinic_memory_v1.json`
+  - 输出：`run_data/probe_results.json` 与 `probe_evaluation.md`
 
 当前主入口文件：
 - `run_5turn_session_test.py`：多轮会话测试基线入口。
