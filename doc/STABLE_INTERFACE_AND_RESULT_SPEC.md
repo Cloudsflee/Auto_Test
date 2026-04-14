@@ -127,11 +127,21 @@ auto_test/results/session_<scenario>_<run_id>/
   dialogue.md
   evaluation.md
   raw_events.jsonl
+  workspace/
+    _manifest.json
+    README.md
+    ... exported workspace files ...
   non_text/
     turn_results.json
     evaluation.json
     README.md
 ```
+
+说明：
+- `workspace/` 目录用于镜像本次会话中“用户可见工作区”相关文件。
+- 文本类文件优先从工具参数（`write/edit`）导出；下载失败时回退到文件下载链路。
+- 图片/二进制文件下载链路为：先尝试 `files/session` API，再回退到 DotAI FS（`POST /dotai/fs/stat` + `POST /dotai/fs/download`）；若都失败则写入 `*.ref.json` 保留引用。
+- DotAI 地址可由 `dotai_base_url`（配置）或 `AUTO_TEST_DOTAI_BASE_URL`（环境变量）提供；未提供时可从 `base_url` 自动推导（`ai-backend` -> `dotai-backend`）。
 
 ---
 
@@ -153,6 +163,14 @@ auto_test/results/session_<scenario>_<run_id>/
     "event_count": 12,
     "run_end": true,
     "run_error": "",
+    "workspace_snapshot": {
+      "source": "events_fallback",
+      "counts": {
+        "all_paths": 0,
+        "md_files": 0,
+        "image_files": 0
+      }
+    },
     "duration_sec": 3.21
   }
 ]

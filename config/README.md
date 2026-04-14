@@ -31,9 +31,10 @@
 - `user_simulator.api_key`: 用户模拟模型 API Key
 - `user_simulator.timeout_sec`: 用户模拟请求超时（秒）
 - `user_simulator.max_turns`: 计划对话轮次上限
+- `user_simulator.capability_mode`: 能力考核模式（`alternating` / `mixed` / `single_random` / `copy_only` / `image_only`）
 - `user_simulator.user_temperature`: 用户发言生成温度（建议 `0.7~1.2`）
 - `user_simulator.role_temperature`: 角色生成温度（建议 `0.8~1.3`）
-- `user_simulator.first_user_message`: first-turn user message. The first sentence is forcibly fixed to "请你清空当前notebook内workbook.md 和files.md的内容"; extra text is appended on the next line.
+- `user_simulator.first_user_message`: first-turn user message. The first sentence is forcibly fixed to "请你把当前记忆文件重置为系统初始模板"; extra text is appended on the next line.
 - `user_simulator.system_prompt_file`: system 提示词文件名（相对 `prompts/`，默认 `user_simulator_system.prompt`）
 - `user_simulator.scenario_prompt_file`: 场景提示词文件名（相对 `prompts/`，默认 `user_simulator_scenario.prompt`）
 - `user_simulator.role_system_prompt_file`: 角色生成 system 提示词文件名（默认 `user_simulator_role_system.prompt`）
@@ -49,10 +50,12 @@
 - LLM 评估优先读取 `llm_eval` 配置；未配置字段会回退到环境变量。
 - 兼容环境变量：`AUTO_TEST_ENABLE_LLM_EVAL`、`AUTO_TEST_EVAL_LLM_URL`、`AUTO_TEST_EVAL_LLM_MODEL`、`AUTO_TEST_EVAL_LLM_API_KEY`、`AUTO_TEST_EVAL_LLM_TIMEOUT_SEC`。
 - 用户模拟优先读取 `user_simulator` 配置；未配置字段会回退到 `AUTO_TEST_USER_SIM_*` 环境变量，最后回退到 `llm_eval` 同名字段。
+- 可用环境变量 `AUTO_TEST_USER_SIM_CAPABILITY_MODE` 覆盖能力考核模式。
 - 用户模拟默认从 `prompts/user_simulator_system.prompt` 与 `prompts/user_simulator_scenario.prompt` 读取提示词。
 - 每次测试开始前会先调用“角色生成器”随机产出一个客户角色，再进入正式多轮对话。
 - `user_simulator` 与 `llm_eval` 职责不同：前者在测试执行时生成“下一轮用户输入”，后者在测试结束后做 LLM 评估。
 - 轮次可直接调节：优先 `user_simulator.max_turns`，也可通过 `AUTO_TEST_MAX_TURNS` 或命令行 `--max-turns` 临时覆盖。
+- 图片评测场景可通过 `AUTO_TEST_TURN_TIMEOUT_SEC` 调整单轮超时（默认 `240` 秒）。
 
 ---
 
@@ -82,3 +85,17 @@
   - Disable interact tools: `AUTO_TEST_DISABLE_INTERACT_TOOLS=true`
   - Disable simulation: `AUTO_TEST_SIMULATE_INTERACT_CALLBACK=false`
 - You can still override everything with `AUTO_TEST_RUN_SETTINGS_JSON`.
+
+---
+
+## Workspace Binary Export (DotAI FS fallback)
+
+- Optional config key: `dotai_base_url`
+  - Example: `http://dotai-backend.prod.api.dotai.internal`
+- Optional env override: `AUTO_TEST_DOTAI_BASE_URL`
+  - Higher priority than `config.dotai_base_url`.
+- If neither is provided, auto-test will try to derive from `base_url`:
+  - replace host prefix `ai-backend` -> `dotai-backend`.
+- Workspace file export order:
+  1. `files/session` API
+  2. DotAI FS `POST /dotai/fs/stat` + `POST /dotai/fs/download`

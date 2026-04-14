@@ -103,6 +103,11 @@ python src/tests/run_5turn_session_test.py --max-turns 30
 - `raw_events.jsonl`
 - `non_text/turn_results.json`
 - `non_text/evaluation.json`
+- `workspace/`（用户可见工作区导出，含 `_manifest.json`、导出的 md 与图片引用/文件）
+
+说明：
+- 工作区文件导出会优先尝试 `files/session` API；若图片/二进制在该链路不可下载，会自动回退到 DotAI FS（`/dotai/fs/stat` + `/dotai/fs/download`）。
+- 可通过 `config.dotai_base_url` 或环境变量 `AUTO_TEST_DOTAI_BASE_URL` 指定 DotAI 后端地址。
 
 ---
 
@@ -111,3 +116,12 @@ python src/tests/run_5turn_session_test.py --max-turns 30
 1. 若后端协议变化，先更新 `doc/STABLE_INTERFACE_AND_RESULT_SPEC.md`
 2. 若仅测试流程变化，优先更新 `README.md` 与 `src/` 代码
 3. 每次运行必须落独立目录，不覆盖历史 `results`
+
+## 8. 能力考核模式
+
+- `user_simulator.capability_mode`（或环境变量 `AUTO_TEST_USER_SIM_CAPABILITY_MODE`）用于控制用户模拟器的能力考核方向：
+  - `alternating`：按轮次交替考核文案/图片能力（默认）
+  - `mixed`：每轮二选一，整体覆盖两种能力
+  - `single_random`：每轮随机考核其中一种能力
+  - `copy_only`：只考核文案能力
+  - `image_only`：只考核图片能力

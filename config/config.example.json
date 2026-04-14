@@ -1,5 +1,6 @@
 {
   "base_url": "http://your-backend.example.com",
+  "dotai_base_url": "http://your-dotai-backend.example.com",
   "auth": {
     "token": "Bearer replace_with_your_token",
     "uid": "replace_with_uid",
@@ -20,9 +21,10 @@
     "api_key": "replace_with_user_simulator_api_key",
     "timeout_sec": 60,
     "max_turns": 20,
+    "capability_mode": "alternating",
     "user_temperature": 0.9,
     "role_temperature": 1.0,
-    "first_user_message": "请你清空当前notebook内workbook.md 和files.md的内容",
+    "first_user_message": "请你把当前记忆文件重置为系统初始模板",
     "system_prompt_file": "user_simulator_system.prompt",
     "scenario_prompt_file": "user_simulator_scenario.prompt",
     "role_system_prompt_file": "user_simulator_role_system.prompt",
