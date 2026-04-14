@@ -1,26 +1,30 @@
-# tests Directory Notes
+# tests 目录说明
 
-- This directory contains executable auto-test flows.
-- Main responsibilities: build requests, run multi-turn sessions, parse SSE events, and write outputs.
-- Unified convention: first turn is fixed to `请你把当前记忆文件重置为系统初始模板`.
-- `user_simulator` supports dynamic role-play user turns (default mode: `provider_context`).
-- Default run tools keep memory/compression related tools and `option_card`.
-- `post_submit` and `ui_cmd` are disabled by default for this test scope.
-- Interrupt callbacks are simulated by default via tool-response replay.
-- You can disable callback simulation with `AUTO_TEST_SIMULATE_INTERACT_CALLBACK=false`.
-- Safety guard: `AUTO_TEST_MAX_SIM_CALLBACK_ROUNDS` (default `8`).
-- Turn count can be controlled by `user_simulator.max_turns`, `AUTO_TEST_MAX_TURNS`, or CLI `--max-turns`.
-- Capability test mode can be configured by `user_simulator.capability_mode` (or env `AUTO_TEST_USER_SIM_CAPABILITY_MODE`):
+- 本目录存放可执行的 auto-test 测试流程。
+- 主要职责：组装请求、执行多轮会话、解析 SSE 事件并写出结果。
+- 统一约定：首轮固定为 `请你把当前记忆文件重置为系统初始模板`。
+- `user_simulator` 支持动态角色扮演用户输入（默认模式 `provider_context`）。
+- 默认工具集保留记忆/压缩相关工具和 `option_card`。
+- `post_submit` 与 `ui_cmd` 在当前测试范围内默认关闭。
+- 交互回调默认启用“模拟回传”。
+- 可通过 `AUTO_TEST_SIMULATE_INTERACT_CALLBACK=false` 关闭模拟回传。
+- 安全保护：`AUTO_TEST_MAX_SIM_CALLBACK_ROUNDS`（默认 `8`）。
+- 轮次可由 `user_simulator.max_turns`、`AUTO_TEST_MAX_TURNS` 或命令行 `--max-turns` 控制。
+- 能力考核模式可由 `user_simulator.capability_mode`（或环境变量 `AUTO_TEST_USER_SIM_CAPABILITY_MODE`）配置：
   - `alternating` / `mixed` / `single_random` / `copy_only` / `image_only`
-- Workspace image/binary export uses chained download fallback:
-  - `files/session` API first
-  - DotAI FS fallback (`/dotai/fs/stat` + `/dotai/fs/download`)
-- DotAI endpoint can be set by `config.dotai_base_url` or env `AUTO_TEST_DOTAI_BASE_URL`.
+- 工作区图片/二进制导出采用链式回退：
+  - 先走 `files/session` API
+  - 失败后走 DotAI FS（`/dotai/fs/stat` + `/dotai/fs/download`）
+- DotAI 地址可通过 `config.dotai_base_url` 或环境变量 `AUTO_TEST_DOTAI_BASE_URL` 指定。
 
-Current entry file:
-- `run_5turn_session_test.py`: multi-turn session test baseline.
+当前主入口文件：
+- `run_5turn_session_test.py`：多轮会话测试基线入口。
 
-- If needed, you can enable advanced interact tools:
-  - `AUTO_TEST_ENABLE_INTERACT_TOOLS=true` (enables both `post_submit` and `ui_cmd`)
-  - or use fine-grained flags: `AUTO_TEST_ENABLE_POST_SUBMIT_TOOL=true`, `AUTO_TEST_ENABLE_UI_CMD_TOOL=true`
-- You can disable all interact tool registration with `AUTO_TEST_DISABLE_INTERACT_TOOLS=true`.
+模块拆分（提升可维护性）：
+- `user_simulator_engine.py`：能力模式策略 + 角色生成 + 用户发言生成
+- `workspace_pipeline.py`：workspace 快照识别 + workspace 导出 + files API / DotAI FS 下载回退
+
+- 如需启用高级交互工具：
+  - `AUTO_TEST_ENABLE_INTERACT_TOOLS=true`（同时开启 `post_submit` 与 `ui_cmd`）
+  - 或细粒度开关：`AUTO_TEST_ENABLE_POST_SUBMIT_TOOL=true`、`AUTO_TEST_ENABLE_UI_CMD_TOOL=true`
+- 可通过 `AUTO_TEST_DISABLE_INTERACT_TOOLS=true` 关闭全部交互工具注册。
