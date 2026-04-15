@@ -1,0 +1,29 @@
+请评估以下探针：
+
+probe_id: {{PROBE_ID}}
+probe_type: {{PROBE_TYPE}}
+description: {{PROBE_DESCRIPTION}}
+target: {{PROBE_TARGET}}
+pass_threshold_0_5: {{PASS_THRESHOLD_0_5}}
+
+评分维度（每维 0~5）：
+{{PROBE_RUBRIC}}
+
+上下文（JSON）：
+{{PROBE_CONTEXT}}
+
+输出格式（仅 JSON）：
+{
+  "pass": true,
+  "overall_0_5": 4.1,
+  "dimension_scores": {
+    "accuracy": 4.0,
+    "context_awareness": 4.5,
+    "artifact_trail": 3.5,
+    "completeness": 4.0,
+    "continuity": 4.5,
+    "instruction_following": 4.0
+  },
+  "reason": "不超过120字，说明结论",
+  "evidence_refs": ["turn:4", "workspace:/workspace/xxx/file.md"]
+}

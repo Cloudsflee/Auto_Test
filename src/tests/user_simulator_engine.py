@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import uuid
 from dataclasses import dataclass
 from typing import Any
@@ -289,17 +290,27 @@ def _call_user_sim_model(
             ],
         }
 
-    try:
-        resp = requests.post(sim_cfg.base_url, headers=headers, json=body, timeout=sim_cfg.timeout_sec)
-        resp.raise_for_status()
-        raw_text = resp.text if isinstance(resp.text, str) else ""
-        content_type = str(resp.headers.get("Content-Type") or "").lower()
-        payload, content = _parse_model_text(wire_api=wire_api, content_type=content_type, raw_text=raw_text)
-        if not content:
-            raise RuntimeError("user_simulator empty content")
-        return content, payload
-    except Exception as exc:
-        raise RuntimeError(f"user_simulator model call failed: {exc}") from exc
+    max_retries = 3
+    retry_backoff_sec = 1.0
+    last_error: Exception | None = None
+    for attempt in range(0, max_retries + 1):
+        try:
+            resp = requests.post(sim_cfg.base_url, headers=headers, json=body, timeout=sim_cfg.timeout_sec)
+            resp.raise_for_status()
+            raw_text = resp.text if isinstance(resp.text, str) else ""
+            content_type = str(resp.headers.get("Content-Type") or "").lower()
+            payload, content = _parse_model_text(wire_api=wire_api, content_type=content_type, raw_text=raw_text)
+            if not content:
+                raise RuntimeError("user_simulator empty content")
+            return content, payload
+        except Exception as exc:
+            last_error = exc
+            if attempt >= max_retries:
+                break
+            # 网络抖动（如 WinError 10054）时退避重试，降低长轮次中断概率。
+            sleep_sec = retry_backoff_sec * (attempt + 1)
+            time.sleep(sleep_sec)
+    raise RuntimeError(f"user_simulator model call failed: {last_error}") from last_error
 
 
 def _build_role_profile(role_json: dict[str, Any]) -> str:

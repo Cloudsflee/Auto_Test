@@ -1,0 +1,4 @@
+version: 1
+target: agent_x
+intent_pool:
+  - TODO: add target-specific intents

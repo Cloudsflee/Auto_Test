@@ -21,6 +21,7 @@
   "user_simulator": {
     "enabled": true,
     "mode": "provider_context",
+    "target_name": "advoo",
     "base_url": "https://api.ikuncode.cc/v1/responses",
     "model": "gpt-5.3-codex",
     "api_key": "replace_with_user_simulator_api_key",
@@ -30,9 +31,30 @@
     "user_temperature": 0.9,
     "role_temperature": 1.0,
     "first_user_message": "请你把当前记忆文件重置为系统初始模板",
-    "system_prompt_file": "user_simulator_system.prompt",
-    "scenario_prompt_file": "user_simulator_scenario.prompt",
-    "role_system_prompt_file": "user_simulator_role_system.prompt",
-    "role_user_prompt_file": "user_simulator_role_user.prompt"
+    "system_prompt_file": "framework/simulator/system/user_simulator_system.prompt",
+    "role_system_prompt_file": "framework/simulator/role_generation/role_system.prompt",
+    "role_user_prompt_file": "framework/simulator/role_generation/role_user.prompt"
+  },
+  "probe_eval": {
+    "enabled": true,
+    "dataset_path": "datasets/probes/clinic_memory_v1.json",
+    "fail_on_error": true,
+    "max_fail_details": 20,
+    "llm_judge": {
+      "enabled": false,
+      "base_url": "https://api.ikuncode.cc/v1/responses",
+      "model": "gpt-5.3-codex",
+      "api_key": "replace_with_probe_judge_api_key",
+      "timeout_sec": 45,
+      "repeats": 3,
+      "max_retries": 2,
+      "fail_open": false,
+      "system_prompt_file": "framework/evaluator/probe/probe_judge_system.prompt",
+      "user_prompt_file": "framework/evaluator/probe/probe_judge_user.prompt"
+    },
+    "score_merge": {
+      "deterministic_weight": 0.65,
+      "llm_weight": 0.35
+    }
   }
 }

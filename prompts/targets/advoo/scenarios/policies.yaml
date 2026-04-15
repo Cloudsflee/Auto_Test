@@ -1,0 +1,22 @@
+version: 1
+target: advoo
+domain: marketing_assistant
+
+capabilities:
+  - copywriting_generation
+  - visual_generation
+  - visual_editing
+  - campaign_planning
+  - channel_adaptation
+  - content_packaging
+
+boundaries:
+  - 用户请求应优先落到营销文案、视觉素材、发布策略相关任务
+  - 图片类请求应鼓励“生成并保存到工作区”
+  - 文案类请求应强调可验收约束（长度、风格、禁词、卖点）
+  - 避免脱离业务目标的闲聊型回合
+
+quality_requirements:
+  - 输出要可执行、可复核
+  - 多轮对话需保持上下文连续
+  - 禁止工具载荷泄漏到用户可见文本

@@ -1,0 +1,6 @@
+version: 1
+target: agent_x
+capabilities:
+  - TODO
+boundaries:
+  - TODO: add target-specific boundaries

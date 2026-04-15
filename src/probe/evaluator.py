@@ -6,8 +6,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+from .llm_judge import run_probe_llm_judge
 from .loader import load_probe_dataset
-from .models import ProbeAssertion, ProbeDataset, ProbeSpec
+from .models import ProbeAssertion, ProbeDataset, ProbeLLMJudgeConfig, ProbeSpec
 
 
 def _safe_json_loads(text: str) -> Any:
@@ -380,32 +381,288 @@ def _build_evidence(value: Any, probe: ProbeSpec) -> dict[str, Any]:
     return {"value": value}
 
 
-def _aggregate_results(dataset: ProbeDataset, probe_results: list[dict[str, Any]]) -> dict[str, Any]:
+def _build_probe_context_slice(
+    ctx: dict[str, Any],
+    probe: ProbeSpec,
+    target_value: Any,
+) -> dict[str, Any]:
+    turn_map = ctx.get("turn_map")
+    if not isinstance(turn_map, dict):
+        turn_map = {}
+    turn_ids = sorted(int(t) for t in turn_map.keys() if isinstance(t, int))
+
+    llm_spec = probe.llm_judge
+    start = llm_spec.turn_window_start if llm_spec else 0
+    end = llm_spec.turn_window_end if llm_spec else 0
+    if turn_ids:
+        if start <= 0:
+            start = min(turn_ids)
+        if end <= 0:
+            end = max(turn_ids)
+    if end > 0 and start > end:
+        end = start
+
+    conversation: list[dict[str, Any]] = []
+    for turn in turn_ids:
+        if turn < start or (end > 0 and turn > end):
+            continue
+        row = turn_map.get(turn)
+        if not isinstance(row, dict):
+            continue
+        conversation.append(
+            {
+                "turn": turn,
+                "user_text": row.get("user_text") or "",
+                "assistant_text": row.get("assistant_text") or "",
+                "run_end": bool(row.get("run_end")),
+                "run_error": row.get("run_error") or "",
+            }
+        )
+
+    workspace_manifest = ctx.get("workspace_manifest")
+    if not isinstance(workspace_manifest, dict):
+        workspace_manifest = {}
+    all_paths = workspace_manifest.get("all_paths")
+    if not isinstance(all_paths, list):
+        all_paths = []
+    counts = workspace_manifest.get("counts")
+    if not isinstance(counts, dict):
+        counts = {}
+
+    return {
+        "probe": {
+            "probe_id": probe.probe_id,
+            "probe_type": probe.probe_type,
+            "judge_mode": probe.judge_mode,
+            "description": probe.description,
+            "target": {"source": probe.target.source, "turn": probe.target.turn},
+        },
+        "target_value_preview": _build_evidence(target_value, probe),
+        "conversation_window": {
+            "start_turn": start,
+            "end_turn": end,
+            "turns": conversation,
+        },
+        "workspace": {
+            "counts": counts,
+            "all_paths_preview": all_paths[:80],
+        },
+        "global_summary": ctx.get("global_summary", {}),
+    }
+
+
+def _evaluate_deterministic_probe(probe: ProbeSpec, target_value: Any) -> dict[str, Any]:
+    assertion_rows: list[dict[str, Any]] = []
+    passed_all = True
+    failures: list[str] = []
+    error_message = ""
+
+    for assertion in probe.assertions:
+        try:
+            passed, actual, detail = _eval_assertion(target_value, assertion)
+            if not passed:
+                passed_all = False
+                failures.append(assertion.assert_type)
+            assertion_rows.append(
+                {
+                    "assert_type": assertion.assert_type,
+                    "passed": bool(passed),
+                    "expected": assertion.expect,
+                    "actual": actual,
+                    "detail": detail,
+                    "negate": assertion.negate,
+                    "field": assertion.field_path,
+                }
+            )
+        except Exception as exc:
+            passed_all = False
+            error_message = f"{exc.__class__.__name__}: {exc}"
+            failures.append(assertion.assert_type)
+            assertion_rows.append(
+                {
+                    "assert_type": assertion.assert_type,
+                    "passed": False,
+                    "expected": assertion.expect,
+                    "actual": None,
+                    "detail": error_message,
+                    "negate": assertion.negate,
+                    "field": assertion.field_path,
+                }
+            )
+
+    return {
+        "probe_id": probe.probe_id,
+        "probe_type": probe.probe_type,
+        "judge_mode": probe.judge_mode,
+        "passed": bool(passed_all),
+        "skipped": False,
+        "critical": bool(probe.critical),
+        "weight": float(probe.weight),
+        "priority": probe.priority,
+        "description": probe.description,
+        "target": {
+            "source": probe.target.source,
+            "turn": probe.target.turn,
+        },
+        "tags": probe.tags,
+        "assertions": assertion_rows,
+        "evidence": _build_evidence(target_value, probe),
+        "failure_reason": "" if passed_all else f"failed_assertions={','.join(failures)}",
+        "error": error_message,
+    }
+
+
+def _evaluate_llm_probe(
+    probe: ProbeSpec,
+    target_value: Any,
+    ctx: dict[str, Any],
+    llm_judge_cfg: ProbeLLMJudgeConfig,
+    prompts_dir: Path | None,
+) -> dict[str, Any]:
+    context_slice = _build_probe_context_slice(ctx, probe, target_value)
+    llm_result = run_probe_llm_judge(
+        probe=probe,
+        probe_context=context_slice,
+        cfg=llm_judge_cfg,
+        prompts_dir=prompts_dir,
+    )
+
+    aggregate = llm_result.get("aggregate")
+    if not isinstance(aggregate, dict):
+        aggregate = {}
+    skipped = bool(llm_result.get("skipped"))
+    final_pass = bool(aggregate.get("final_pass")) if not skipped else False
+    error = str(llm_result.get("error") or "").strip()
+    failure_reason = ""
+    if skipped:
+        failure_reason = "llm_probe_skipped"
+    elif not final_pass:
+        failure_reason = error or "llm_judge_final_pass=false"
+
+    return {
+        "probe_id": probe.probe_id,
+        "probe_type": probe.probe_type,
+        "judge_mode": probe.judge_mode,
+        "passed": final_pass,
+        "skipped": skipped,
+        "critical": bool(probe.critical),
+        "weight": float(probe.weight),
+        "priority": probe.priority,
+        "description": probe.description,
+        "target": {
+            "source": probe.target.source,
+            "turn": probe.target.turn,
+        },
+        "tags": probe.tags,
+        "assertions": [],
+        "evidence": _build_evidence(target_value, probe),
+        "llm_judge": llm_result,
+        "failure_reason": failure_reason,
+        "error": error,
+    }
+
+
+def _calc_score(rows: list[dict[str, Any]]) -> float:
+    effective = [row for row in rows if not row.get("skipped")]
+    weighted_total = sum(float(row.get("weight") or 0.0) for row in effective)
+    if weighted_total <= 0:
+        return 0.0
+    weighted_pass = sum(float(row.get("weight") or 0.0) for row in effective if row.get("passed"))
+    return weighted_pass / weighted_total
+
+
+def _calc_group_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    total = len(rows)
+    skipped = sum(1 for row in rows if row.get("skipped"))
+    effective = [row for row in rows if not row.get("skipped")]
+    passed = sum(1 for row in effective if row.get("passed"))
+    failed = len(effective) - passed
+    score = _calc_score(rows)
+    return {
+        "total": total,
+        "passed": passed,
+        "failed": failed,
+        "skipped": skipped,
+        "score": round(score, 4),
+    }
+
+
+def _resolve_final_score(
+    deterministic_score: float,
+    llm_score: float,
+    has_deterministic: bool,
+    has_llm: bool,
+    deterministic_weight: float,
+    llm_weight: float,
+) -> tuple[float, dict[str, float]]:
+    det_w = max(0.0, float(deterministic_weight))
+    llm_w = max(0.0, float(llm_weight))
+
+    if has_deterministic and has_llm:
+        if det_w <= 0 and llm_w <= 0:
+            det_w, llm_w = 0.65, 0.35
+        total_w = det_w + llm_w
+        det_final_w = det_w / total_w
+        llm_final_w = llm_w / total_w
+        final_score = deterministic_score * det_final_w + llm_score * llm_final_w
+        return final_score, {"deterministic": round(det_final_w, 4), "llm": round(llm_final_w, 4)}
+
+    if has_deterministic:
+        return deterministic_score, {"deterministic": 1.0, "llm": 0.0}
+    if has_llm:
+        return llm_score, {"deterministic": 0.0, "llm": 1.0}
+    return 0.0, {"deterministic": 0.0, "llm": 0.0}
+
+
+def _aggregate_results(
+    dataset: ProbeDataset,
+    probe_results: list[dict[str, Any]],
+    deterministic_weight: float,
+    llm_weight: float,
+) -> dict[str, Any]:
     total = len(probe_results)
-    passed = sum(1 for row in probe_results if row.get("passed"))
-    failed = total - passed
-    weighted_total = sum(float(row.get("weight") or 0.0) for row in probe_results)
-    weighted_pass = sum(float(row.get("weight") or 0.0) for row in probe_results if row.get("passed"))
-    weighted_score = (weighted_pass / weighted_total) if weighted_total > 0 else 0.0
+    skipped = sum(1 for row in probe_results if row.get("skipped"))
+    effective_rows = [row for row in probe_results if not row.get("skipped")]
+    passed = sum(1 for row in effective_rows if row.get("passed"))
+    failed = len(effective_rows) - passed
 
     by_type: dict[str, dict[str, Any]] = {}
     for row in probe_results:
         key = str(row.get("probe_type") or "unknown")
-        item = by_type.setdefault(key, {"total": 0, "passed": 0, "weighted_total": 0.0, "weighted_pass": 0.0})
-        item["total"] += 1
-        if row.get("passed"):
-            item["passed"] += 1
-        weight = float(row.get("weight") or 0.0)
-        item["weighted_total"] += weight
-        if row.get("passed"):
-            item["weighted_pass"] += weight
-    for key, item in by_type.items():
-        wt = float(item.get("weighted_total") or 0.0)
-        item["score"] = round((float(item.get("weighted_pass") or 0.0) / wt) if wt > 0 else 0.0, 4)
-        item.pop("weighted_total", None)
-        item.pop("weighted_pass", None)
+        rows = by_type.setdefault(key, {"_rows": []})
+        rows["_rows"].append(row)
+    for key in list(by_type.keys()):
+        rows = by_type[key].pop("_rows", [])
+        by_type[key] = _calc_group_stats(rows)
 
-    critical_failed = [row.get("probe_id") for row in probe_results if row.get("critical") and not row.get("passed")]
+    by_mode_rows = {
+        "deterministic": [row for row in probe_results if row.get("judge_mode") == "deterministic"],
+        "llm": [row for row in probe_results if row.get("judge_mode") == "llm"],
+    }
+    by_judge_mode = {mode: _calc_group_stats(rows) for mode, rows in by_mode_rows.items()}
+
+    deterministic_score = _calc_score(by_mode_rows["deterministic"])
+    llm_subjective_score = _calc_score(by_mode_rows["llm"])
+    has_det = any(not row.get("skipped") for row in by_mode_rows["deterministic"])
+    has_llm = any(not row.get("skipped") for row in by_mode_rows["llm"])
+    final_weighted_score, final_weights = _resolve_final_score(
+        deterministic_score=deterministic_score,
+        llm_score=llm_subjective_score,
+        has_deterministic=has_det,
+        has_llm=has_llm,
+        deterministic_weight=deterministic_weight,
+        llm_weight=llm_weight,
+    )
+
+    critical_failed = [
+        row.get("probe_id")
+        for row in probe_results
+        if row.get("critical") and (not row.get("passed")) and (not row.get("skipped"))
+    ]
+
+    llm_rows = by_mode_rows["llm"]
+    llm_probe_failed = sum(1 for row in llm_rows if (not row.get("skipped")) and (not row.get("passed")))
+    llm_probe_skipped = sum(1 for row in llm_rows if row.get("skipped"))
 
     return {
         "dataset_id": dataset.dataset_id,
@@ -413,9 +670,18 @@ def _aggregate_results(dataset: ProbeDataset, probe_results: list[dict[str, Any]
         "total_probes": total,
         "passed_probes": passed,
         "failed_probes": failed,
-        "weighted_score": round(weighted_score, 4),
+        "skipped_probes": skipped,
+        "weighted_score": round(final_weighted_score, 4),
+        "deterministic_score": round(deterministic_score, 4),
+        "llm_subjective_score": round(llm_subjective_score, 4),
+        "final_weighted_score": round(final_weighted_score, 4),
+        "score_merge_weights": final_weights,
         "critical_failed": critical_failed,
         "by_type": by_type,
+        "by_judge_mode": by_judge_mode,
+        "llm_probe_count": len(llm_rows),
+        "llm_probe_failed": llm_probe_failed,
+        "llm_probe_skipped": llm_probe_skipped,
     }
 
 
@@ -424,74 +690,37 @@ def evaluate_probes(
     turn_results_path: Path,
     workspace_manifest_path: Path,
     raw_events_path: Path | None = None,
+    llm_judge_cfg: ProbeLLMJudgeConfig | None = None,
+    prompts_dir: Path | None = None,
+    deterministic_weight: float = 0.65,
+    llm_weight: float = 0.35,
 ) -> dict[str, Any]:
     dataset = load_probe_dataset(dataset_path)
     ctx = _build_probe_context(turn_results_path, workspace_manifest_path, raw_events_path=raw_events_path)
 
+    judge_cfg = llm_judge_cfg if isinstance(llm_judge_cfg, ProbeLLMJudgeConfig) else ProbeLLMJudgeConfig()
     probe_results: list[dict[str, Any]] = []
     for probe in dataset.probes:
         target_value = _extract_target_value(ctx, probe)
-        assertion_rows: list[dict[str, Any]] = []
-        passed_all = True
-        failures: list[str] = []
-        error_message = ""
+        if probe.judge_mode == "llm":
+            one = _evaluate_llm_probe(
+                probe=probe,
+                target_value=target_value,
+                ctx=ctx,
+                llm_judge_cfg=judge_cfg,
+                prompts_dir=prompts_dir,
+            )
+            probe_results.append(one)
+            continue
+        one = _evaluate_deterministic_probe(probe=probe, target_value=target_value)
+        probe_results.append(one)
 
-        for assertion in probe.assertions:
-            try:
-                passed, actual, detail = _eval_assertion(target_value, assertion)
-                if not passed:
-                    passed_all = False
-                    failures.append(assertion.assert_type)
-                assertion_rows.append(
-                    {
-                        "assert_type": assertion.assert_type,
-                        "passed": bool(passed),
-                        "expected": assertion.expect,
-                        "actual": actual,
-                        "detail": detail,
-                        "negate": assertion.negate,
-                        "field": assertion.field_path,
-                    }
-                )
-            except Exception as exc:
-                passed_all = False
-                error_message = f"{exc.__class__.__name__}: {exc}"
-                failures.append(assertion.assert_type)
-                assertion_rows.append(
-                    {
-                        "assert_type": assertion.assert_type,
-                        "passed": False,
-                        "expected": assertion.expect,
-                        "actual": None,
-                        "detail": error_message,
-                        "negate": assertion.negate,
-                        "field": assertion.field_path,
-                    }
-                )
-
-        probe_results.append(
-            {
-                "probe_id": probe.probe_id,
-                "probe_type": probe.probe_type,
-                "judge_mode": probe.judge_mode,
-                "passed": bool(passed_all),
-                "critical": bool(probe.critical),
-                "weight": float(probe.weight),
-                "priority": probe.priority,
-                "description": probe.description,
-                "target": {
-                    "source": probe.target.source,
-                    "turn": probe.target.turn,
-                },
-                "tags": probe.tags,
-                "assertions": assertion_rows,
-                "evidence": _build_evidence(target_value, probe),
-                "failure_reason": "" if passed_all else f"failed_assertions={','.join(failures)}",
-                "error": error_message,
-            }
-        )
-
-    summary = _aggregate_results(dataset, probe_results)
+    summary = _aggregate_results(
+        dataset=dataset,
+        probe_results=probe_results,
+        deterministic_weight=deterministic_weight,
+        llm_weight=llm_weight,
+    )
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "dataset": {
@@ -500,6 +729,15 @@ def evaluate_probes(
             "dataset_version": dataset.dataset_version,
             "description": dataset.description,
             "owner": dataset.owner,
+        },
+        "config": {
+            "deterministic_weight": round(max(0.0, deterministic_weight), 4),
+            "llm_weight": round(max(0.0, llm_weight), 4),
+            "llm_judge_enabled": bool(judge_cfg.enabled),
+            "llm_judge_model": judge_cfg.model,
+            "llm_judge_repeats": int(judge_cfg.repeats),
+            "llm_judge_max_retries": int(judge_cfg.max_retries),
+            "llm_judge_fail_open": bool(judge_cfg.fail_open),
         },
         "summary": summary,
         "results": probe_results,
@@ -514,6 +752,9 @@ def write_probe_evaluation_md(
     dataset = payload.get("dataset")
     if not isinstance(dataset, dict):
         dataset = {}
+    config = payload.get("config")
+    if not isinstance(config, dict):
+        config = {}
     summary = payload.get("summary")
     if not isinstance(summary, dict):
         summary = {}
@@ -534,13 +775,26 @@ def write_probe_evaluation_md(
         f"- total_probes: `{summary.get('total_probes', 0)}`",
         f"- passed_probes: `{summary.get('passed_probes', 0)}`",
         f"- failed_probes: `{summary.get('failed_probes', 0)}`",
-        f"- weighted_score: `{summary.get('weighted_score', 0)}`",
+        f"- skipped_probes: `{summary.get('skipped_probes', 0)}`",
+        f"- deterministic_score: `{summary.get('deterministic_score', 0)}`",
+        f"- llm_subjective_score: `{summary.get('llm_subjective_score', 0)}`",
+        f"- final_weighted_score: `{summary.get('final_weighted_score', summary.get('weighted_score', 0))}`",
         f"- critical_failed: `{summary.get('critical_failed', [])}`",
+        "",
+        "## Runtime Config",
+        "",
+        f"- deterministic_weight: `{config.get('deterministic_weight', 0)}`",
+        f"- llm_weight: `{config.get('llm_weight', 0)}`",
+        f"- llm_judge_enabled: `{config.get('llm_judge_enabled', False)}`",
+        f"- llm_judge_model: `{config.get('llm_judge_model', '')}`",
+        f"- llm_judge_repeats: `{config.get('llm_judge_repeats', 0)}`",
+        f"- llm_judge_max_retries: `{config.get('llm_judge_max_retries', 0)}`",
+        f"- llm_judge_fail_open: `{config.get('llm_judge_fail_open', False)}`",
         "",
         "## By Type",
         "",
-        "| type | total | passed | score |",
-        "| --- | --- | --- | --- |",
+        "| type | total | passed | failed | skipped | score |",
+        "| --- | --- | --- | --- | --- | --- |",
     ]
     by_type = summary.get("by_type")
     if isinstance(by_type, dict):
@@ -549,22 +803,70 @@ def write_probe_evaluation_md(
             if not isinstance(item, dict):
                 continue
             lines.append(
-                f"| `{key}` | `{item.get('total', 0)}` | `{item.get('passed', 0)}` | `{item.get('score', 0)}` |"
+                f"| `{key}` | `{item.get('total', 0)}` | `{item.get('passed', 0)}` | "
+                f"`{item.get('failed', 0)}` | `{item.get('skipped', 0)}` | `{item.get('score', 0)}` |"
+            )
+    lines.extend(
+        [
+            "",
+            "## By Judge Mode",
+            "",
+            "| judge_mode | total | passed | failed | skipped | score |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ]
+    )
+    by_judge_mode = summary.get("by_judge_mode")
+    if isinstance(by_judge_mode, dict):
+        for key in ("deterministic", "llm"):
+            item = by_judge_mode.get(key)
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"| `{key}` | `{item.get('total', 0)}` | `{item.get('passed', 0)}` | "
+                f"`{item.get('failed', 0)}` | `{item.get('skipped', 0)}` | `{item.get('score', 0)}` |"
             )
     lines.append("")
 
-    failed_rows = [row for row in results if isinstance(row, dict) and not row.get("passed")]
+    failed_rows = [row for row in results if isinstance(row, dict) and (not row.get("passed")) and (not row.get("skipped"))]
+    skipped_rows = [row for row in results if isinstance(row, dict) and row.get("skipped")]
     lines.extend(["## Failed Probes", ""])
     if not failed_rows:
         lines.append("- none")
     else:
         for row in failed_rows[: max(1, max_fail_details)]:
-            lines.extend(
-                [
-                    f"- `{row.get('probe_id')}` ({row.get('probe_type')})",
-                    f"  - reason: `{row.get('failure_reason') or row.get('error') or ''}`",
-                ]
+            lines.append(f"- `{row.get('probe_id')}` ({row.get('probe_type')}, judge={row.get('judge_mode')})")
+            lines.append(f"  - reason: `{row.get('failure_reason') or row.get('error') or ''}`")
+
+    lines.extend(["", "## Skipped Probes", ""])
+    if not skipped_rows:
+        lines.append("- none")
+    else:
+        for row in skipped_rows[: max(1, max_fail_details)]:
+            lines.append(f"- `{row.get('probe_id')}` ({row.get('probe_type')}, judge={row.get('judge_mode')})")
+            lines.append(f"  - reason: `{row.get('failure_reason') or row.get('error') or ''}`")
+
+    lines.extend(["", "## High Variance LLM Probes", ""])
+    llm_rows = [
+        row
+        for row in results
+        if isinstance(row, dict)
+        and row.get("judge_mode") == "llm"
+        and isinstance((row.get("llm_judge") or {}).get("aggregate"), dict)
+    ]
+    llm_rows.sort(
+        key=lambda row: _as_float(((row.get("llm_judge") or {}).get("aggregate") or {}).get("overall_stddev"), 0.0),
+        reverse=True,
+    )
+    if not llm_rows:
+        lines.append("- none")
+    else:
+        for row in llm_rows[: max(1, max_fail_details)]:
+            agg = (row.get("llm_judge") or {}).get("aggregate")
+            if not isinstance(agg, dict):
+                agg = {}
+            lines.append(
+                f"- `{row.get('probe_id')}` stddev=`{agg.get('overall_stddev', 0)}` "
+                f"mean=`{agg.get('overall_mean', 0)}` pass_rate=`{agg.get('pass_rate', 0)}`"
             )
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-

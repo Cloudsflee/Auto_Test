@@ -16,9 +16,14 @@
   - 先走 `files/session` API
   - 失败后走 DotAI FS（`/dotai/fs/stat` + `/dotai/fs/download`）
 - DotAI 地址可通过 `config.dotai_base_url` 或环境变量 `AUTO_TEST_DOTAI_BASE_URL` 指定。
-- 探针评估（Phase 1，确定性）可通过环境变量开启：
+- 提示词目录已重构为两层：
+  - `prompts/framework/`：通用机制与格式约束
+  - `prompts/targets/<target_name>/`：目标智能体专属场景/画像/rubric
+- 探针评估（Phase 1 + Phase 2）可通过环境变量开启：
   - `AUTO_TEST_ENABLE_PROBE_EVAL=true`
   - 可选：`AUTO_TEST_PROBE_DATASET_PATH=datasets/probes/clinic_memory_v1.json`
+  - 可选：`AUTO_TEST_ENABLE_PROBE_LLM_JUDGE=true`
+  - 可选：`AUTO_TEST_PROBE_LLM_URL` / `AUTO_TEST_PROBE_LLM_MODEL` / `AUTO_TEST_PROBE_LLM_API_KEY`
   - 输出：`run_data/probe_results.json` 与 `probe_evaluation.md`
 
 当前主入口文件：

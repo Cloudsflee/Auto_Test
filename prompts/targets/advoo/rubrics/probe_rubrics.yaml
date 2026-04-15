@@ -1,0 +1,35 @@
+version: 1
+target: advoo
+rubric_id: probe_subjective_v1
+
+dimensions:
+  accuracy:
+    description: 路径、文件、事实细节是否准确
+    scale_0: 完全错误或与事实冲突
+    scale_3: 基本正确但有缺漏
+    scale_5: 准确且无关键错误
+  context_awareness:
+    description: 是否正确利用当前对话上下文
+    scale_0: 与上下文脱节
+    scale_3: 只覆盖部分上下文
+    scale_5: 完整对齐上下文状态
+  artifact_trail:
+    description: 是否清楚追踪工作区制品状态
+    scale_0: 不知道文件/图片情况
+    scale_3: 能提到部分制品
+    scale_5: 文件与状态描述完整
+  completeness:
+    description: 是否覆盖请求的全部关键部分
+    scale_0: 大量遗漏
+    scale_3: 主要项覆盖但有缺口
+    scale_5: 全面覆盖
+  continuity:
+    description: 是否支持在压缩记忆后继续推进
+    scale_0: 无法继续推进
+    scale_3: 可继续但阻力较大
+    scale_5: 可直接衔接下一步
+  instruction_following:
+    description: 是否遵循 probe 的格式和约束
+    scale_0: 明显违背要求
+    scale_3: 基本遵循
+    scale_5: 严格遵循

@@ -38,11 +38,12 @@ src/
 ## 4. probe 目录
 
 - `probe/evaluator.py`
-  - 作用：执行 Phase 1 探针评估（确定性）
+  - 作用：执行 Phase 1+2 探针评估（确定性 + 主观 LLM）
   - 职责：
     1. 读取探针数据集
     2. 从 `turn_results.json` 与 `workspace/_manifest.json` 构建上下文
-    3. 执行断言并输出 `probe_results.json` 与 `probe_evaluation.md`
+    3. 根据 `judge_mode` 执行确定性断言或 LLM 裁判
+    4. 输出 `probe_results.json` 与 `probe_evaluation.md`
 
 ---
 

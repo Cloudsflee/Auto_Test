@@ -1,0 +1,177 @@
+{
+  "dataset_id": "clinic_memory_v2_mixed",
+  "dataset_version": "2.0.0",
+  "description": "Phase2 mixed probes: deterministic + llm subjective probes",
+  "owner": "auto_test",
+  "probes": [
+    {
+      "probe_id": "recall_first_user_reset_phrase",
+      "probe_type": "recall",
+      "judge_mode": "deterministic",
+      "priority": "high",
+      "weight": 1.0,
+      "critical": true,
+      "target": {
+        "source": "turn_user_text",
+        "turn": 1
+      },
+      "assertions": [
+        {
+          "assert_type": "contains_all",
+          "expect": [
+            "请你把当前记忆文件重置为系统初始模板"
+          ]
+        }
+      ],
+      "description": "首轮用户输入必须包含固定重置指令"
+    },
+    {
+      "probe_id": "recall_first_assistant_non_empty",
+      "probe_type": "recall",
+      "judge_mode": "deterministic",
+      "priority": "high",
+      "weight": 1.0,
+      "critical": true,
+      "target": {
+        "source": "turn_assistant_text",
+        "turn": 1
+      },
+      "assertions": [
+        {
+          "assert_type": "non_empty"
+        }
+      ],
+      "description": "首轮助手回复应非空"
+    },
+    {
+      "probe_id": "artifact_workspace_manifest_session_id_non_empty",
+      "probe_type": "artifact",
+      "judge_mode": "deterministic",
+      "weight": 1.0,
+      "critical": true,
+      "target": {
+        "source": "workspace_manifest"
+      },
+      "assertions": [
+        {
+          "assert_type": "json_field_non_empty",
+          "field": "session_id"
+        }
+      ],
+      "description": "workspace manifest 必须包含 session_id"
+    },
+    {
+      "probe_id": "artifact_unresolved_files_zero",
+      "probe_type": "artifact",
+      "judge_mode": "deterministic",
+      "weight": 1.0,
+      "target": {
+        "source": "workspace_manifest"
+      },
+      "assertions": [
+        {
+          "assert_type": "json_field_equals",
+          "expect": {
+            "field": "counts.unresolved_files",
+            "value": 0
+          }
+        }
+      ],
+      "description": "未解析文件数量应为 0"
+    },
+    {
+      "probe_id": "continuation_global_success_subjective_v1",
+      "probe_type": "continuation",
+      "judge_mode": "llm",
+      "weight": 1.2,
+      "target": {
+        "source": "global_summary"
+      },
+      "llm_judge": {
+        "rubric_id": "probe_subjective_v1",
+        "pass_threshold_0_5": 3.2,
+        "dimensions": [
+          "accuracy",
+          "context_awareness",
+          "completeness",
+          "continuity",
+          "instruction_following"
+        ],
+        "turn_window": {
+          "start": 1,
+          "end": 0
+        },
+        "require_evidence_paths": true
+      },
+      "description": "检查整体对话在连续推进上的主观质量"
+    },
+    {
+      "probe_id": "decision_final_response_strategy_subjective_v1",
+      "probe_type": "decision",
+      "judge_mode": "llm",
+      "weight": 1.2,
+      "target": {
+        "source": "turn_assistant_text",
+        "turn": 5
+      },
+      "llm_judge": {
+        "rubric_id": "probe_subjective_v1",
+        "pass_threshold_0_5": 3.2,
+        "dimensions": [
+          "accuracy",
+          "context_awareness",
+          "artifact_trail",
+          "completeness",
+          "continuity",
+          "instruction_following"
+        ],
+        "turn_window": {
+          "start": 1,
+          "end": 5
+        },
+        "require_evidence_paths": true
+      },
+      "description": "检查最终回复是否维持历史决策一致性"
+    },
+    {
+      "probe_id": "continuation_any_run_error_false",
+      "probe_type": "continuation",
+      "judge_mode": "deterministic",
+      "weight": 1.0,
+      "target": {
+        "source": "global_summary"
+      },
+      "assertions": [
+        {
+          "assert_type": "json_field_equals",
+          "expect": {
+            "field": "any_run_error",
+            "value": false
+          }
+        }
+      ],
+      "description": "全局不应出现 run_error"
+    },
+    {
+      "probe_id": "decision_first_assistant_no_tool_payload",
+      "probe_type": "decision",
+      "judge_mode": "deterministic",
+      "weight": 0.8,
+      "target": {
+        "source": "turn_assistant_text",
+        "turn": 1
+      },
+      "assertions": [
+        {
+          "assert_type": "not_contains_any",
+          "expect": [
+            "<tool>",
+            "\"tool_name\"",
+            "\"tool_input\""
+          ]
+        }
+      ],
+      "description": "首轮助手可见文本不应包含工具载荷"
+    }
+  ]
+}

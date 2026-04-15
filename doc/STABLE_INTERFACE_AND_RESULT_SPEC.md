@@ -141,6 +141,9 @@ auto_test/results/session_<scenario>_<run_id>/
 说明：
 - `workspace/` 目录用于镜像本次会话中“用户可见工作区”相关文件。
 - `run_data/probe_results.json` 为可选产物：当启用 Probe Evaluation 时，记录探针逐项判定结果与汇总分数。
+- Phase 2 开启后，`probe_results.json` 支持混合评分：
+  - `judge_mode=deterministic`（规则断言）
+  - `judge_mode=llm`（主观探针裁判，含重复采样聚合）
 - 文本类文件优先从工具参数（`write/edit`）导出；下载失败时回退到文件下载链路。
 - 图片/二进制文件下载链路为：先尝试 `files/session` API，再回退到 DotAI FS（`POST /dotai/fs/stat` + `POST /dotai/fs/download`）；若都失败则写入 `*.ref.json` 保留引用。
 - DotAI 地址可由 `dotai_base_url`（配置）或 `AUTO_TEST_DOTAI_BASE_URL`（环境变量）提供；未提供时可从 `base_url` 自动推导（`ai-backend` -> `dotai-backend`）。
@@ -205,6 +208,16 @@ auto_test/results/session_<scenario>_<run_id>/
 1. 未启用：`enabled=false`
 2. 启用但跳过：`enabled=true, skipped=true, reason=...`
 3. 启用并完成：`enabled=true, skipped=false, ...`
+
+## 8.2 Probe 评估扩展（Phase 2）
+
+`probe_results.json.summary` 推荐包含：
+
+- `deterministic_score`
+- `llm_subjective_score`
+- `final_weighted_score`
+- `by_judge_mode`
+- `llm_probe_count / llm_probe_failed / llm_probe_skipped`
 
 ---
 

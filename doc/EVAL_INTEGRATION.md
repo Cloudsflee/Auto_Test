@@ -19,6 +19,11 @@
 - `evaluation.md` 便于人工快速查看
 - `evaluation.json` 便于程序统计与趋势分析
 
+探针评估（开启时）支持两类评分：
+
+- `judge_mode=deterministic`：字符串/正则/路径/字段断言
+- `judge_mode=llm`：主观探针六维评分（仅 continuation/decision）
+
 ---
 
 ## 3. 当前模式：LLM-only（必选）
@@ -54,12 +59,27 @@
 
 提示词建议放在：
 
-- `prompts/user_simulator_system.prompt`
-- `prompts/user_simulator_scenario.prompt`
+- `prompts/framework/simulator/system/user_simulator_system.prompt`
+- `prompts/targets/<target_name>/scenarios/intent_pool.yaml`
+- `prompts/targets/<target_name>/scenarios/policies.yaml`
 
 ---
 
 ## 5. 记忆/压缩专项扩展建议（保留）
+
+## 5.1 Probe LLM 裁判开关（Phase 2）
+
+- `AUTO_TEST_ENABLE_PROBE_EVAL=true`
+- `AUTO_TEST_ENABLE_PROBE_LLM_JUDGE=true`（可选）
+- `AUTO_TEST_PROBE_LLM_URL / MODEL / API_KEY`（可选）
+
+输出中可关注：
+
+- `summary.deterministic_score`
+- `summary.llm_subjective_score`
+- `summary.final_weighted_score`
+- `summary.by_judge_mode`
+- `results[].llm_judge.aggregate`
 
 建议在当前 smoke 评估基础上增加：
 

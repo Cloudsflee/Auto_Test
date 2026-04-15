@@ -22,7 +22,7 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from eval.dialogue_evaluator import LLMEvalConfig, evaluate_with_llm, write_evaluation_md
-from probe import evaluate_probes, write_probe_evaluation_md
+from probe import ProbeLLMJudgeConfig, evaluate_probes, write_probe_evaluation_md
 from tests.user_simulator_engine import (
     GeneratedRole,
     UserSimulatorConfig,
@@ -59,6 +59,7 @@ class AuthConfig:
     source_path: Path
     llm_eval: dict[str, Any]
     user_simulator: dict[str, Any]
+    probe_eval: dict[str, Any]
 
 
 @dataclass
@@ -76,15 +77,23 @@ class ProbeEvalConfig:
     dataset_path: Path
     fail_on_error: bool
     max_fail_details: int
+    llm_judge: ProbeLLMJudgeConfig
+    deterministic_weight: float
+    llm_weight: float
 
 
 REQUIRED_NOTEBOOK_CLEAR_TEXT = "请你把当前记忆文件重置为系统初始模板"
 DEFAULT_FIRST_USER_TEXT = REQUIRED_NOTEBOOK_CLEAR_TEXT
 PROMPTS_DIR = AUTO_TEST_DIR / "prompts"
-DEFAULT_USER_SIM_SYSTEM_PROMPT_FILE = PROMPTS_DIR / "user_simulator_system.prompt"
-DEFAULT_USER_SIM_SCENARIO_PROMPT_FILE = PROMPTS_DIR / "user_simulator_scenario.prompt"
-DEFAULT_USER_SIM_ROLE_SYSTEM_PROMPT_FILE = PROMPTS_DIR / "user_simulator_role_system.prompt"
-DEFAULT_USER_SIM_ROLE_USER_PROMPT_FILE = PROMPTS_DIR / "user_simulator_role_user.prompt"
+FRAMEWORK_PROMPTS_DIR = PROMPTS_DIR / "framework"
+TARGET_PROMPTS_DIR = PROMPTS_DIR / "targets"
+DEFAULT_TARGET_NAME = "advoo"
+DEFAULT_USER_SIM_SYSTEM_PROMPT_FILE = FRAMEWORK_PROMPTS_DIR / "simulator" / "system" / "user_simulator_system.prompt"
+DEFAULT_USER_SIM_SCENARIO_PROMPT_FILE = FRAMEWORK_PROMPTS_DIR / "simulator" / "system" / "scenario_template.prompt"
+DEFAULT_USER_SIM_ROLE_SYSTEM_PROMPT_FILE = FRAMEWORK_PROMPTS_DIR / "simulator" / "role_generation" / "role_system.prompt"
+DEFAULT_USER_SIM_ROLE_USER_PROMPT_FILE = FRAMEWORK_PROMPTS_DIR / "simulator" / "role_generation" / "role_user.prompt"
+DEFAULT_PROBE_JUDGE_SYSTEM_PROMPT_FILE = FRAMEWORK_PROMPTS_DIR / "evaluator" / "probe" / "probe_judge_system.prompt"
+DEFAULT_PROBE_JUDGE_USER_PROMPT_FILE = FRAMEWORK_PROMPTS_DIR / "evaluator" / "probe" / "probe_judge_user.prompt"
 INTERACT_TOOL_NAMES = {"option_card", "post_submit", "ui_cmd"}
 DEFAULT_SIM_CALLBACK_MAX_ROUNDS = 8
 
@@ -116,6 +125,36 @@ def _load_prompt_template(prompt_path: Path, fallback: str) -> str:
         return fallback
     text = prompt_path.read_text(encoding="utf-8", errors="ignore").strip()
     return text or fallback
+
+
+def _load_optional_text(path: Path, fallback: str = "") -> str:
+    if not path.exists():
+        return fallback
+    text = path.read_text(encoding="utf-8", errors="ignore").strip()
+    return text or fallback
+
+
+def _normalize_target_name(raw: Any) -> str:
+    name = re.sub(r"[^a-zA-Z0-9_-]", "", str(raw or "").strip().lower())
+    return name or DEFAULT_TARGET_NAME
+
+
+def _resolve_target_dir(target_name: str) -> Path:
+    return TARGET_PROMPTS_DIR / _normalize_target_name(target_name)
+
+
+def _render_prompt_vars(template: str, vars_map: dict[str, str]) -> str:
+    out = str(template or "")
+    for key, value in vars_map.items():
+        out = out.replace(f"{{{{{key}}}}}", str(value))
+    return out
+
+
+def _trim_prompt_text(text: str, max_chars: int = 6000) -> str:
+    raw = str(text or "").strip()
+    if len(raw) <= max_chars:
+        return raw
+    return raw[: max_chars - 20] + "\n...(truncated)..."
 
 
 def _parse_trace_id_from_traceparent(traceparent: str) -> str:
@@ -272,6 +311,9 @@ def _load_json_config(path: Path) -> AuthConfig:
     user_simulator = obj.get("user_simulator")
     if not isinstance(user_simulator, dict):
         user_simulator = {}
+    probe_eval = obj.get("probe_eval")
+    if not isinstance(probe_eval, dict):
+        probe_eval = {}
 
     if not base_url or not token or not uid or not email:
         raise RuntimeError(f"缺少必填字段: base_url/token/uid/email, path={path.as_posix()}")
@@ -288,6 +330,7 @@ def _load_json_config(path: Path) -> AuthConfig:
         source_path=path,
         llm_eval=llm_eval,
         user_simulator=user_simulator,
+        probe_eval=probe_eval,
     )
 
 
@@ -315,6 +358,7 @@ def _load_text_config(path: Path) -> AuthConfig:
         source_path=path,
         llm_eval={},
         user_simulator={},
+        probe_eval={},
     )
 
 
@@ -435,36 +479,98 @@ def build_user_simulator_config(cfg: AuthConfig, llm_eval_cfg: LLMEvalConfig) ->
     mode = str(sim_cfg.get("mode") or os.getenv("AUTO_TEST_USER_SIM_MODE", "provider_context")).strip().lower()
     if mode not in {"provider_context", "explicit_context"}:
         mode = "provider_context"
+    target_name = _normalize_target_name(
+        sim_cfg.get("target_name")
+        or sim_cfg.get("target")
+        or os.getenv("AUTO_TEST_TARGET_NAME", DEFAULT_TARGET_NAME)
+    )
+    target_dir = _resolve_target_dir(target_name)
+    target_intent_pool = _trim_prompt_text(
+        _load_optional_text(
+            target_dir / "scenarios" / "intent_pool.yaml",
+            "- 需求澄清\n- 文案创作\n- 图片生成\n- 方案追问\n- 发布整理\n- 总结验收",
+        )
+    )
+    target_policies = _trim_prompt_text(
+        _load_optional_text(
+            target_dir / "scenarios" / "policies.yaml",
+            "capabilities:\n"
+            "  - text_generation\n"
+            "  - image_generation\n"
+            "  - planning\n"
+            "constraints:\n"
+            "  - follow_user_instruction\n"
+            "  - avoid_tool_payload_leak",
+        )
+    )
+    industry_options = str(
+        sim_cfg.get("industry_options")
+        or "餐饮、零售、教育、医疗、制造、跨境电商、本地生活、SaaS"
+    ).strip()
+    identity_options = str(
+        sim_cfg.get("identity_options")
+        or "老板、运营负责人、市场负责人、产品经理、区域代理、采购负责人"
+    ).strip()
+    personas_dir = target_dir / "personas"
+    personas_file = personas_dir / f"{target_name}_users.json"
+    if not personas_file.exists():
+        candidates = sorted(personas_dir.glob("*.json")) if personas_dir.exists() else []
+        personas_file = candidates[0] if candidates else personas_file
+    target_personas = _trim_prompt_text(_load_optional_text(personas_file, "[]"))
+    target_rubrics = _trim_prompt_text(_load_optional_text(target_dir / "rubrics" / "probe_rubrics.yaml", ""))
+
+    max_turns = max(
+        1,
+        min(
+            128,
+            _cfg_int(
+                sim_cfg.get("max_turns"),
+                _env_int("AUTO_TEST_MAX_TURNS", _env_int("AUTO_TEST_USER_SIM_MAX_TURNS", 5)),
+            ),
+        ),
+    )
     first_user_message = _ensure_required_note_clear_text(
         str(sim_cfg.get("first_user_message") or "").strip() or DEFAULT_FIRST_USER_TEXT
     )
 
     default_system_prompt = (
-        "你是自动化测试中的“客户用户模拟器”。"
-        "你的任务是基于助手上一轮回复，生成下一轮用户提问。"
+        "你是自动化测试中的“用户模拟器”。"
+        "你的任务是基于当前角色与历史对话，生成下一轮用户输入。"
         "你必须只返回 JSON，对象字段包含：user_text, stop, reason。"
-        "其中 user_text 必须是给助手的自然语言用户输入，不要输出解释。"
+        "其中 user_text 必须是自然语言请求，不要输出解释。"
     )
     default_scenario_prompt = (
-        "你在扮演随机客户，与助手进行多轮沟通。\n"
-        "随机性要求：\n"
-        "1. 每轮随机选择一个意图提问，不固定顺序。\n"
-        "2. 意图池：口号创作/卖点追问/预算约束/竞品比较/复述核对/总结要求。\n"
-        "3. 语气随机（正式、口语、追问、质疑），长度随机（10~80字）。\n"
+        "你在扮演目标智能体的真实客户，与助手进行多轮协作。\n"
+        "目标名称：{{TARGET_NAME}}\n\n"
+        "目标能力边界与策略（来自 target policies）：\n"
+        "{{TARGET_POLICIES}}\n\n"
+        "目标意图池（来自 target intent pool）：\n"
+        "{{TARGET_INTENT_POOL}}\n\n"
+        "探针评分参考（可选）：\n"
+        "{{TARGET_RUBRICS}}\n\n"
+        "随机化要求：\n"
+        "1. 每轮选择一个主意图，不固定顺序。\n"
+        "2. 每轮要有可执行交付或明确追问。\n"
+        "3. 语气随机（正式/口语/追问/质疑），长度随机（10~100字）。\n"
         "4. 不要重复上一轮用户句式。\n\n"
         "轮次上限：{{MAX_TURNS}}。仅在你认为目标完成时再 stop=true。"
     )
     default_role_system_prompt = (
-        "你是测试数据设计器，专门生成“随机客户角色”。"
+        "你是测试数据设计器，专门生成“可扮演的随机客户角色”。"
         "请只返回 JSON，不要输出解释。"
     )
     default_role_user_prompt = (
         "请生成一个用于多轮对话测试的随机客户角色。\n"
+        "目标名称：{{TARGET_NAME}}\n"
+        "目标能力边界（供参考）：\n{{TARGET_POLICIES}}\n\n"
+        "可选用户画像样本（可借鉴但禁止照抄）：\n{{TARGET_PERSONAS}}\n\n"
+        "约束信息：\n"
+        "- 本轮最大对话数：{{MAX_TURNS}}\n"
+        "- 首轮固定用户动作：{{REQUIRED_NOTEBOOK_CLEAR_TEXT}}\n\n"
         "要求：\n"
         "1. 角色要有真实业务背景与沟通风格。\n"
-        "2. 必须包含冲突约束（例如预算、时效、品牌调性冲突）。\n"
-        "3. 尽量避免与常见模板同质化。\n"
-        "4. 轮次上限参考：{{MAX_TURNS}}。\n\n"
+        "2. 必须包含冲突约束（例如预算、时效、合规、调性冲突）。\n"
+        "3. 尽量避免与常见模板同质化。\n\n"
         "输出 JSON 字段：\n"
         "- role_name\n"
         "- identity\n"
@@ -479,10 +585,8 @@ def build_user_simulator_config(cfg: AuthConfig, llm_eval_cfg: LLMEvalConfig) ->
         str(sim_cfg.get("system_prompt_file") or "").strip(),
         DEFAULT_USER_SIM_SYSTEM_PROMPT_FILE,
     )
-    scenario_prompt_path = _resolve_prompt_path(
-        str(sim_cfg.get("scenario_prompt_file") or "").strip(),
-        DEFAULT_USER_SIM_SCENARIO_PROMPT_FILE,
-    )
+    scenario_prompt_file = str(sim_cfg.get("scenario_prompt_file") or "").strip()
+    scenario_prompt_path = _resolve_prompt_path(scenario_prompt_file, DEFAULT_USER_SIM_SCENARIO_PROMPT_FILE)
     role_system_prompt_path = _resolve_prompt_path(
         str(sim_cfg.get("role_system_prompt_file") or "").strip(),
         DEFAULT_USER_SIM_ROLE_SYSTEM_PROMPT_FILE,
@@ -495,18 +599,36 @@ def build_user_simulator_config(cfg: AuthConfig, llm_eval_cfg: LLMEvalConfig) ->
         system_prompt_path,
         default_system_prompt,
     )
-    scenario_prompt = str(sim_cfg.get("scenario_prompt") or "").strip() or _load_prompt_template(
-        scenario_prompt_path,
-        default_scenario_prompt,
+    target_vars = {
+        "TARGET_NAME": target_name,
+        "TARGET_INTENT_POOL": target_intent_pool,
+        "TARGET_POLICIES": target_policies,
+        "TARGET_PERSONAS": target_personas,
+        "TARGET_RUBRICS": target_rubrics,
+        "INDUSTRY_OPTIONS": industry_options,
+        "IDENTITY_OPTIONS": identity_options,
+        "MAX_TURNS": str(max_turns),
+        "REQUIRED_NOTEBOOK_CLEAR_TEXT": REQUIRED_NOTEBOOK_CLEAR_TEXT,
+    }
+    scenario_template = str(sim_cfg.get("scenario_prompt") or "").strip()
+    if not scenario_template:
+        scenario_template = _load_prompt_template(
+            scenario_prompt_path if scenario_prompt_file else DEFAULT_USER_SIM_SCENARIO_PROMPT_FILE,
+            default_scenario_prompt,
+        )
+    scenario_prompt = _render_prompt_vars(
+        scenario_template,
+        target_vars,
     )
     role_system_prompt = str(sim_cfg.get("role_system_prompt") or "").strip() or _load_prompt_template(
         role_system_prompt_path,
         default_role_system_prompt,
     )
-    role_user_prompt = str(sim_cfg.get("role_user_prompt") or "").strip() or _load_prompt_template(
+    role_user_template = str(sim_cfg.get("role_user_prompt") or "").strip() or _load_prompt_template(
         role_user_prompt_path,
         default_role_user_prompt,
     )
+    role_user_prompt = _render_prompt_vars(role_user_template, target_vars)
 
     return UserSimulatorConfig(
         enabled=_cfg_bool(
@@ -527,16 +649,7 @@ def build_user_simulator_config(cfg: AuthConfig, llm_eval_cfg: LLMEvalConfig) ->
             sim_cfg.get("timeout_sec"),
             _env_int("AUTO_TEST_USER_SIM_TIMEOUT_SEC", 60),
         ),
-        max_turns=max(
-            1,
-            min(
-                128,
-                _cfg_int(
-                    sim_cfg.get("max_turns"),
-                    _env_int("AUTO_TEST_MAX_TURNS", _env_int("AUTO_TEST_USER_SIM_MAX_TURNS", 5)),
-                ),
-            ),
-        ),
+        max_turns=max_turns,
         first_user_message=first_user_message,
         system_prompt=system_prompt,
         scenario_prompt=scenario_prompt,
@@ -1005,19 +1118,75 @@ def build_expected_facts() -> dict[str, str]:
     return {}
 
 
-def build_probe_eval_config() -> ProbeEvalConfig:
-    enabled = _env_bool("AUTO_TEST_ENABLE_PROBE_EVAL", False)
+def build_probe_eval_config(cfg: AuthConfig) -> ProbeEvalConfig:
+    probe_cfg = cfg.probe_eval if isinstance(cfg.probe_eval, dict) else {}
+    llm_cfg = probe_cfg.get("llm_judge")
+    if not isinstance(llm_cfg, dict):
+        llm_cfg = {}
+    score_merge = probe_cfg.get("score_merge")
+    if not isinstance(score_merge, dict):
+        score_merge = {}
+    default_probe_system_rel = DEFAULT_PROBE_JUDGE_SYSTEM_PROMPT_FILE.relative_to(PROMPTS_DIR).as_posix()
+    default_probe_user_rel = DEFAULT_PROBE_JUDGE_USER_PROMPT_FILE.relative_to(PROMPTS_DIR).as_posix()
+
+    enabled = _env_bool("AUTO_TEST_ENABLE_PROBE_EVAL", _cfg_bool(probe_cfg.get("enabled"), False))
     default_rel = Path("datasets") / "probes" / "clinic_memory_v1.json"
-    raw_dataset = str(os.getenv("AUTO_TEST_PROBE_DATASET_PATH", "")).strip()
+    raw_dataset = str(os.getenv("AUTO_TEST_PROBE_DATASET_PATH", "")).strip() or str(probe_cfg.get("dataset_path") or "").strip()
     dataset_path = (AUTO_TEST_DIR / default_rel).resolve()
     if raw_dataset:
         custom = Path(raw_dataset)
         dataset_path = custom if custom.is_absolute() else (AUTO_TEST_DIR / custom).resolve()
+
+    llm_judge_cfg = ProbeLLMJudgeConfig(
+        enabled=_env_bool("AUTO_TEST_ENABLE_PROBE_LLM_JUDGE", _cfg_bool(llm_cfg.get("enabled"), False)),
+        base_url=str(
+            os.getenv("AUTO_TEST_PROBE_LLM_URL", "")
+            or llm_cfg.get("base_url")
+            or llm_cfg.get("url")
+            or ""
+        ).strip(),
+        model=str(os.getenv("AUTO_TEST_PROBE_LLM_MODEL", "") or llm_cfg.get("model") or "").strip(),
+        api_key=str(os.getenv("AUTO_TEST_PROBE_LLM_API_KEY", "") or llm_cfg.get("api_key") or llm_cfg.get("key") or "").strip(),
+        timeout_sec=max(10, min(300, _env_int("AUTO_TEST_PROBE_LLM_TIMEOUT_SEC", _cfg_int(llm_cfg.get("timeout_sec"), 45)))),
+        repeats=max(1, min(9, _env_int("AUTO_TEST_PROBE_LLM_REPEATS", _cfg_int(llm_cfg.get("repeats"), 3)))),
+        max_retries=max(0, min(6, _env_int("AUTO_TEST_PROBE_LLM_MAX_RETRIES", _cfg_int(llm_cfg.get("max_retries"), 2)))),
+        fail_open=_env_bool("AUTO_TEST_PROBE_LLM_FAIL_OPEN", _cfg_bool(llm_cfg.get("fail_open"), False)),
+        system_prompt_path=str(
+            os.getenv("AUTO_TEST_PROBE_LLM_SYSTEM_PROMPT_FILE", "")
+            or llm_cfg.get("system_prompt_file")
+            or default_probe_system_rel
+        ).strip(),
+        user_prompt_path=str(
+            os.getenv("AUTO_TEST_PROBE_LLM_USER_PROMPT_FILE", "")
+            or llm_cfg.get("user_prompt_file")
+            or default_probe_user_rel
+        ).strip(),
+    )
+    deterministic_weight = _env_float(
+        "AUTO_TEST_PROBE_DETERMINISTIC_WEIGHT",
+        _cfg_float(score_merge.get("deterministic_weight"), 0.65),
+    )
+    llm_weight = _env_float(
+        "AUTO_TEST_PROBE_LLM_FINAL_WEIGHT",
+        _cfg_float(score_merge.get("llm_weight"), 0.35),
+    )
     return ProbeEvalConfig(
         enabled=enabled,
         dataset_path=dataset_path,
-        fail_on_error=_env_bool("AUTO_TEST_PROBE_FAIL_ON_DATASET_ERROR", True),
-        max_fail_details=max(1, min(100, _env_int("AUTO_TEST_PROBE_MAX_FAIL_DETAILS", 20))),
+        fail_on_error=_env_bool(
+            "AUTO_TEST_PROBE_FAIL_ON_DATASET_ERROR",
+            _cfg_bool(probe_cfg.get("fail_on_error"), True),
+        ),
+        max_fail_details=max(
+            1,
+            min(
+                100,
+                _env_int("AUTO_TEST_PROBE_MAX_FAIL_DETAILS", _cfg_int(probe_cfg.get("max_fail_details"), 20)),
+            ),
+        ),
+        llm_judge=llm_judge_cfg,
+        deterministic_weight=max(0.0, min(1.0, deterministic_weight)),
+        llm_weight=max(0.0, min(1.0, llm_weight)),
     )
 
 
@@ -1119,6 +1288,9 @@ def write_meta_md(
             ]
         )
     if isinstance(probe_eval, dict):
+        probe_cfg = probe_eval.get("config")
+        if not isinstance(probe_cfg, dict):
+            probe_cfg = {}
         summary = probe_eval.get("summary")
         if isinstance(summary, dict):
             lines.extend(
@@ -1131,8 +1303,20 @@ def write_meta_md(
                     f"- total_probes: `{summary.get('total_probes', 0)}`",
                     f"- passed_probes: `{summary.get('passed_probes', 0)}`",
                     f"- failed_probes: `{summary.get('failed_probes', 0)}`",
-                    f"- weighted_score: `{summary.get('weighted_score', 0)}`",
+                    f"- skipped_probes: `{summary.get('skipped_probes', 0)}`",
+                    f"- deterministic_score: `{summary.get('deterministic_score', 0)}`",
+                    f"- llm_subjective_score: `{summary.get('llm_subjective_score', 0)}`",
+                    f"- final_weighted_score: `{summary.get('final_weighted_score', summary.get('weighted_score', 0))}`",
+                    f"- llm_probe_count: `{summary.get('llm_probe_count', 0)}`",
+                    f"- llm_probe_failed: `{summary.get('llm_probe_failed', 0)}`",
+                    f"- llm_probe_skipped: `{summary.get('llm_probe_skipped', 0)}`",
                     f"- critical_failed: `{summary.get('critical_failed', [])}`",
+                    f"- score_merge: `det={probe_cfg.get('deterministic_weight', 0)}, llm={probe_cfg.get('llm_weight', 0)}`",
+                    f"- llm_judge_enabled: `{probe_cfg.get('llm_judge_enabled', False)}`",
+                    f"- llm_judge_model: `{probe_cfg.get('llm_judge_model', '')}`",
+                    f"- llm_judge_repeats: `{probe_cfg.get('llm_judge_repeats', 0)}`",
+                    f"- llm_judge_max_retries: `{probe_cfg.get('llm_judge_max_retries', 0)}`",
+                    f"- llm_judge_fail_open: `{probe_cfg.get('llm_judge_fail_open', False)}`",
                 ]
             )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1185,7 +1369,7 @@ def main() -> int:
     expected_facts = build_expected_facts()
     run_settings = build_run_settings()
     llm_eval_cfg = build_llm_eval_config(cfg)
-    probe_eval_cfg = build_probe_eval_config()
+    probe_eval_cfg = build_probe_eval_config(cfg)
     user_sim_cfg = build_user_simulator_config(cfg, llm_eval_cfg)
     persist_type = build_persist_type()
     exec_max_turns = build_exec_max_turns()
@@ -1213,6 +1397,19 @@ def main() -> int:
         print(f"[INFO] llm_eval_model={llm_eval_cfg.model}")
     print(f"[INFO] probe_eval_enabled={probe_eval_cfg.enabled}")
     print(f"[INFO] probe_eval_dataset={probe_eval_cfg.dataset_path.as_posix()}")
+    print(
+        "[INFO] probe_eval_score_merge="
+        f"deterministic:{probe_eval_cfg.deterministic_weight},llm:{probe_eval_cfg.llm_weight}"
+    )
+    print(f"[INFO] probe_llm_judge_enabled={probe_eval_cfg.llm_judge.enabled}")
+    if probe_eval_cfg.llm_judge.enabled:
+        print(f"[INFO] probe_llm_judge_url={probe_eval_cfg.llm_judge.base_url}")
+        print(f"[INFO] probe_llm_judge_model={probe_eval_cfg.llm_judge.model}")
+        print(
+            "[INFO] probe_llm_judge_repeats="
+            f"{probe_eval_cfg.llm_judge.repeats},retries={probe_eval_cfg.llm_judge.max_retries},"
+            f"fail_open={probe_eval_cfg.llm_judge.fail_open}"
+        )
 
     if args.max_turns > 0:
         user_sim_cfg.max_turns = max(1, min(128, args.max_turns))
@@ -1334,6 +1531,10 @@ def main() -> int:
                 turn_results_path=run_data_dir / "turn_results.json",
                 workspace_manifest_path=result_dir / "workspace" / "_manifest.json",
                 raw_events_path=raw_events_path,
+                llm_judge_cfg=probe_eval_cfg.llm_judge,
+                prompts_dir=PROMPTS_DIR,
+                deterministic_weight=probe_eval_cfg.deterministic_weight,
+                llm_weight=probe_eval_cfg.llm_weight,
             )
             (run_data_dir / "probe_results.json").write_text(
                 json.dumps(probe_eval_payload, ensure_ascii=False, indent=2) + "\n",
@@ -1351,7 +1552,9 @@ def main() -> int:
                     f"total={summary.get('total_probes', 0)} "
                     f"passed={summary.get('passed_probes', 0)} "
                     f"failed={summary.get('failed_probes', 0)} "
-                    f"score={summary.get('weighted_score', 0)}"
+                    f"score={summary.get('final_weighted_score', summary.get('weighted_score', 0))} "
+                    f"det={summary.get('deterministic_score', 0)} "
+                    f"llm={summary.get('llm_subjective_score', 0)}"
                 )
         except Exception as exc:
             if probe_eval_cfg.fail_on_error:
@@ -1414,7 +1617,7 @@ def main() -> int:
         "# run_data 结构说明\n\n"
         "- `turn_results.json`: 每轮结构化结果。\n"
         "- `evaluation.json`: LLM-only 评估结果。\n"
-        "- `probe_results.json`: 探针评估结构化结果（启用 `AUTO_TEST_ENABLE_PROBE_EVAL=true` 时生成）。\n"
+        "- `probe_results.json`: 探针评估结构化结果（启用 `AUTO_TEST_ENABLE_PROBE_EVAL=true` 时生成；支持 deterministic + llm judge）。\n"
         "- `../workspace/`: 用户可见工作区导出（含 `_manifest.json` 与文件落盘结果）。\n",
         encoding="utf-8",
     )

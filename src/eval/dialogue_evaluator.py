@@ -194,6 +194,16 @@ def _load_prompt(prompt_file: Path, fallback: str) -> str:
     return fallback
 
 
+def _load_prompt_from_candidates(prompts_dir: Path, rel_paths: list[str], fallback: str) -> str:
+    for rel in rel_paths:
+        candidate = prompts_dir / rel
+        if candidate.exists():
+            text = candidate.read_text(encoding="utf-8", errors="ignore")
+            if text.strip():
+                return text
+    return fallback
+
+
 def _build_llm_prompts(
     results: list[dict[str, Any]],
     expected_facts: dict[str, str],
@@ -213,8 +223,20 @@ def _build_llm_prompts(
         "对话：\n{{CONVERSATION}}"
     )
 
-    system_template = _load_prompt(prompts_dir / "llm_eval_system.prompt", fallback_system)
-    user_template = _load_prompt(prompts_dir / "llm_eval_user.prompt", fallback_user)
+    system_template = _load_prompt_from_candidates(
+        prompts_dir,
+        [
+            "framework/evaluator/overall/llm_eval_system.prompt",
+        ],
+        fallback_system,
+    )
+    user_template = _load_prompt_from_candidates(
+        prompts_dir,
+        [
+            "framework/evaluator/overall/llm_eval_user.prompt",
+        ],
+        fallback_user,
+    )
 
     expected_lines = "\n".join(f"- {key}={value}" for key, value in expected_facts.items())
     conversation = render_conversation_text(results)

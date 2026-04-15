@@ -4,6 +4,16 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
+LLM_SUBJECTIVE_DIMENSIONS = [
+    "accuracy",
+    "context_awareness",
+    "artifact_trail",
+    "completeness",
+    "continuity",
+    "instruction_following",
+]
+
+
 @dataclass
 class ProbeAssertion:
     assert_type: str
@@ -22,12 +32,37 @@ class ProbeTarget:
 
 
 @dataclass
+class ProbeLLMJudgeSpec:
+    rubric_id: str = "probe_subjective_v1"
+    pass_threshold_0_5: float = 3.2
+    dimensions: list[str] = field(default_factory=lambda: list(LLM_SUBJECTIVE_DIMENSIONS))
+    turn_window_start: int = 0
+    turn_window_end: int = 0
+    require_evidence_paths: bool = False
+
+
+@dataclass
+class ProbeLLMJudgeConfig:
+    enabled: bool = False
+    base_url: str = ""
+    model: str = ""
+    api_key: str = ""
+    timeout_sec: int = 45
+    repeats: int = 3
+    max_retries: int = 2
+    fail_open: bool = False
+    system_prompt_path: str = ""
+    user_prompt_path: str = ""
+
+
+@dataclass
 class ProbeSpec:
     probe_id: str
     probe_type: str
     judge_mode: str
     target: ProbeTarget
     assertions: list[ProbeAssertion]
+    llm_judge: ProbeLLMJudgeSpec | None = None
     weight: float = 1.0
     critical: bool = False
     priority: str = "normal"

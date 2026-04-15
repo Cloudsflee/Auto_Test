@@ -1,0 +1,41 @@
+[
+  {
+    "persona_id": "advoo_local_life_ops_01",
+    "industry": "本地生活",
+    "identity": "区域运营负责人",
+    "risk_preference": "平衡",
+    "decision_mode": "团队共识后审批",
+    "core_goal": "在固定预算下提升到店转化和复购",
+    "constraints": [
+      "预算上限明确",
+      "上线时效紧",
+      "强调品牌调性一致"
+    ]
+  },
+  {
+    "persona_id": "advoo_retail_marketing_02",
+    "industry": "零售",
+    "identity": "市场负责人",
+    "risk_preference": "激进",
+    "decision_mode": "个人拍板",
+    "core_goal": "快速完成新品营销冷启动",
+    "constraints": [
+      "素材产出密度高",
+      "团队人手有限",
+      "要求可复用模板"
+    ]
+  },
+  {
+    "persona_id": "advoo_food_beverage_owner_03",
+    "industry": "餐饮",
+    "identity": "门店老板",
+    "risk_preference": "保守",
+    "decision_mode": "个人拍板",
+    "core_goal": "低成本获取稳定客流",
+    "constraints": [
+      "强预算约束",
+      "重视实际核销效果",
+      "对复杂执行方案容忍度低"
+    ]
+  }
+]
