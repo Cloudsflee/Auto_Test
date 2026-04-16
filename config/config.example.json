@@ -1,24 +1,130 @@
 {
+  "_comment": "auto_test 主配置文件（JSON）。本文件采用“注释字段”方式说明含义，运行时会忽略未知字段。",
+  "_comment_usage": "建议先复制为 config.local.json 再填真实账号信息。所有 *_api_key / token 请勿提交到公共仓库。",
+  "_comment_env": "多环境配置说明：默认使用 prod，可通过 --env test 或 AUTO_TEST_ENV=test 切换。",
+  "active_env": "prod",
+  "environments": {
+    "_comment": "仅放需要按环境切换的字段（base_url / dotai_base_url / auth）。",
+    "prod": {
+      "base_url": "http://your-backend.prod.example.com",
+      "dotai_base_url": "http://your-dotai-backend.prod.example.com",
+      "auth": {
+        "token": "Bearer replace_with_prod_token",
+        "uid": "replace_with_prod_uid",
+        "email": "replace_with_prod_email@example.com"
+      }
+    },
+    "test": {
+      "base_url": "http://your-backend.test.example.com",
+      "dotai_base_url": "http://your-dotai-backend.test.example.com",
+      "auth": {
+        "token": "Bearer replace_with_test_token",
+        "uid": "replace_with_test_uid",
+        "email": "replace_with_test_email@example.com"
+      }
+    }
+  },
   "base_url": "http://your-backend.example.com",
   "dotai_base_url": "http://your-dotai-backend.example.com",
   "proxy": {
+    "_comment": "网络代理配置。若系统环境变量 HTTP_PROXY/HTTPS_PROXY 已存在，环境变量优先。",
     "http": "http://127.0.0.1:7890",
     "https": "http://127.0.0.1:7890",
     "no_proxy": ""
   },
   "auth": {
+    "_comment": "被测后端会话鉴权信息。token 通常是 Bearer <jwt>。",
     "token": "Bearer replace_with_your_token",
     "uid": "replace_with_uid",
     "email": "replace_with_email@example.com"
   },
   "llm_eval": {
+    "_comment": "对话整体评估器配置。旧口径与新口径（foundation/profile）都在这里控制。",
+    "_comment_fields": {
+      "enabled": "是否启用 LLM 总评估。",
+      "base_url/model/api_key": "评估模型调用地址与鉴权。",
+      "timeout_sec": "评估请求超时秒数。",
+      "primary_mode": "主判定来源：llm_v1 / foundation_v2 / final_v2。",
+      "shadow_pass_threshold_0_100": "shadow 体系通过阈值（0-100）。"
+    },
     "enabled": true,
     "base_url": "https://api.ikuncode.cc/v1/responses",
     "model": "gpt-5.3-codex",
     "api_key": "replace_with_eval_api_key",
-    "timeout_sec": 60
+    "timeout_sec": 60,
+    "primary_mode": "foundation_v2",
+    "shadow_pass_threshold_0_100": 70,
+    "foundation": {
+      "_comment": "通用评估底盘（默认五维：任务完成、指令遵循、连贯性、安全、工具正确性）。",
+      "enabled": true,
+      "weights": {
+        "task_completion": 0.25,
+        "instruction_following": 0.2,
+        "coherence": 0.2,
+        "safety": 0.2,
+        "tool_correctness": 0.15
+      }
+    },
+    "profile": {
+      "_comment": "可插拔 profile 的全局控制层（选择谁参与、按什么场景路由、与底盘如何融合）。",
+      "_comment_fields": {
+        "active": "默认主 profile 名称（旧逻辑兼容入口）。",
+        "active_profiles": "默认启用的 profile 列表（可多选）。",
+        "active_profiles_by_capability_mode": "按 user_simulator.capability_mode 路由 profile；命中后优先于 active_profiles。",
+        "enabled": "是否总体启用 profile 层。",
+        "weight": "profile 层与 foundation 层融合权重（0-1）。",
+        "fallback_to_foundation_only": "profile 不可用时是否回退到 foundation-only。"
+      },
+      "active": "memory_compression",
+      "active_profiles": [
+        "memory_compression"
+      ],
+      "active_profiles_by_capability_mode": {
+        "copy_only": [
+          "memory_compression"
+        ],
+        "image_only": [
+          "memory_compression",
+          "safety_heavy"
+        ]
+      },
+      "enabled": true,
+      "weight": 0.35,
+      "fallback_to_foundation_only": true
+    },
+    "profiles": {
+      "_comment": "各 profile 的独立配置区。建议按业务场景持续扩展（如 safety_heavy/tool_heavy）。",
+      "memory_compression": {
+        "_comment": "记忆/压缩专项 profile。用于评估记忆召回、压缩保真、状态连续。",
+        "enabled": true,
+        "merge_weight": 1.0,
+        "weights": {
+          "memory_recall": 0.4,
+          "compression_fidelity": 0.35,
+          "state_continuity": 0.25
+        }
+      },
+      "safety_heavy": {
+        "_comment": "安全偏置 profile 示例。可用于高风险场景下提高安全相关权重。",
+        "enabled": false,
+        "merge_weight": 1.0,
+        "weights": {
+          "safety": 0.5,
+          "instruction_following": 0.3,
+          "coherence": 0.2
+        }
+      }
+    }
   },
   "user_simulator": {
+    "_comment": "自动用户模拟器配置：用于生成每轮用户输入、驱动多轮对话。",
+    "_comment_fields": {
+      "mode": "provider_context / explicit_context。",
+      "target_name": "目标助手名称，对应 prompts/targets/<target_name>。",
+      "max_turns": "模拟轮数上限。",
+      "capability_mode": "能力考核模式（会影响 profile 路由）。",
+      "first_user_message": "首轮固定句；当前约定为“请你把当前记忆文件重置为系统初始模板”。"
+    },
     "enabled": true,
     "mode": "provider_context",
     "target_name": "advoo",
@@ -36,11 +142,19 @@
     "role_user_prompt_file": "framework/simulator/role_generation/role_user.prompt"
   },
   "probe_eval": {
+    "_comment": "探针评估配置：用于 deterministic/llm judge 的专项判定。",
+    "_comment_fields": {
+      "enabled": "是否启用探针评估。",
+      "dataset_path": "探针数据集路径（相对 auto_test 根目录）。",
+      "fail_on_error": "探针异常时是否直接中断。",
+      "score_merge": "deterministic 与 llm judge 的加权融合。"
+    },
     "enabled": true,
     "dataset_path": "datasets/probes/clinic_memory_v1.json",
     "fail_on_error": true,
     "max_fail_details": 20,
     "llm_judge": {
+      "_comment": "主观探针 LLM 裁判配置（仅对 judge_mode=llm 的探针生效）。",
       "enabled": false,
       "base_url": "https://api.ikuncode.cc/v1/responses",
       "model": "gpt-5.3-codex",

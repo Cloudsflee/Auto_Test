@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 import json
@@ -15,7 +15,7 @@ from urllib.parse import urlparse, urlunparse
 
 import requests
 
-# 允许直接运行本文件时从 src/ 下导入评估模块。
+# 鍏佽鐩存帴杩愯鏈枃浠舵椂浠?src/ 涓嬪鍏ヨ瘎浼版ā鍧椼€?
 AUTO_TEST_DIR = Path(__file__).resolve().parents[2]
 SRC_DIR = AUTO_TEST_DIR / "src"
 if str(SRC_DIR) not in sys.path:
@@ -57,6 +57,7 @@ class AuthConfig:
     uid: str
     email: str
     source_path: Path
+    selected_env: str
     llm_eval: dict[str, Any]
     user_simulator: dict[str, Any]
     probe_eval: dict[str, Any]
@@ -82,7 +83,7 @@ class ProbeEvalConfig:
     llm_weight: float
 
 
-REQUIRED_NOTEBOOK_CLEAR_TEXT = "请你把当前记忆文件重置为系统初始模板"
+REQUIRED_NOTEBOOK_CLEAR_TEXT = "璇蜂綘鎶婂綋鍓嶈蹇嗘枃浠堕噸缃负绯荤粺鍒濆妯℃澘"
 DEFAULT_FIRST_USER_TEXT = REQUIRED_NOTEBOOK_CLEAR_TEXT
 PROMPTS_DIR = AUTO_TEST_DIR / "prompts"
 FRAMEWORK_PROMPTS_DIR = PROMPTS_DIR / "framework"
@@ -261,6 +262,12 @@ def parse_runtime_args(argv: list[str]) -> argparse.Namespace:
         default=0,
         help="Override user_simulator.max_turns for this run only.",
     )
+    parser.add_argument(
+        "--env",
+        type=str,
+        default="",
+        help="Target runtime environment (prod/test). Default is prod.",
+    )
     return parser.parse_args(argv)
 
 
@@ -271,40 +278,79 @@ def resolve_config_path() -> Path:
     return CFG_PATH_CANDIDATES[0]
 
 
-def _load_json_config(path: Path) -> AuthConfig:
+def _normalize_env_name(raw: Any, default: str = "prod") -> str:
+    text = str(raw or "").strip().lower()
+    if text in {"prod", "production"}:
+        return "prod"
+    if text in {"test", "testing", "staging", "stage"}:
+        return "test"
+    return default
+
+
+def _merge_dict(primary: Any, fallback: Any) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    if isinstance(fallback, dict):
+        out.update(fallback)
+    if isinstance(primary, dict):
+        out.update(primary)
+    return out
+
+
+def _resolve_active_env_name(obj: dict[str, Any], runtime_env: str) -> str:
+    if runtime_env:
+        return _normalize_env_name(runtime_env, "prod")
+    env_from_var = str(os.getenv("AUTO_TEST_ENV", "")).strip()
+    if env_from_var:
+        return _normalize_env_name(env_from_var, "prod")
+    env_from_cfg = str(obj.get("active_env") or "").strip()
+    if env_from_cfg:
+        return _normalize_env_name(env_from_cfg, "prod")
+    return "prod"
+
+
+def _load_json_config(path: Path, runtime_env: str) -> AuthConfig:
     obj = _safe_json_loads(path.read_text(encoding="utf-8", errors="ignore"))
     if not isinstance(obj, dict):
-        raise RuntimeError(f"配置文件不是合法 JSON: {path.as_posix()}")
+        raise RuntimeError(f"閰嶇疆鏂囦欢涓嶆槸鍚堟硶 JSON: {path.as_posix()}")
 
-    auth = obj.get("auth")
-    if not isinstance(auth, dict):
-        auth = {}
+    active_env = _resolve_active_env_name(obj, runtime_env)
+    environments = obj.get("environments")
+    env_obj: dict[str, Any] = {}
+    if isinstance(environments, dict) and environments:
+        chosen = environments.get(active_env)
+        if not isinstance(chosen, dict):
+            raise RuntimeError(
+                f"environment '{active_env}' not found in config.environments, path={path.as_posix()}"
+            )
+        env_obj = chosen
 
-    base_url = str(obj.get("base_url", "")).strip().rstrip("/")
-    dotai_base_url = str(obj.get("dotai_base_url", "")).strip().rstrip("/")
-    proxy = obj.get("proxy")
-    if not isinstance(proxy, dict):
-        proxy = {}
+    auth = _merge_dict(env_obj.get("auth"), obj.get("auth"))
+    base_url = str(env_obj.get("base_url") or obj.get("base_url") or "").strip().rstrip("/")
+    dotai_base_url = str(env_obj.get("dotai_base_url") or obj.get("dotai_base_url") or "").strip().rstrip("/")
+    proxy = _merge_dict(env_obj.get("proxy"), obj.get("proxy"))
     proxy_http = str(
         proxy.get("http")
         or proxy.get("http_proxy")
+        or env_obj.get("http_proxy")
         or obj.get("http_proxy")
         or ""
     ).strip()
     proxy_https = str(
         proxy.get("https")
         or proxy.get("https_proxy")
+        or env_obj.get("https_proxy")
         or obj.get("https_proxy")
         or ""
     ).strip()
     proxy_no_proxy = str(
         proxy.get("no_proxy")
+        or env_obj.get("no_proxy")
         or obj.get("no_proxy")
         or ""
     ).strip()
-    token = str(auth.get("token", "") or obj.get("token", "")).strip()
-    uid = str(auth.get("uid", "") or obj.get("uid", "")).strip()
-    email = str(auth.get("email", "") or obj.get("email", "")).strip()
+    token = str(auth.get("token", "") or env_obj.get("token", "") or obj.get("token", "")).strip()
+    uid = str(auth.get("uid", "") or env_obj.get("uid", "") or obj.get("uid", "")).strip()
+    email = str(auth.get("email", "") or env_obj.get("email", "") or obj.get("email", "")).strip()
     llm_eval = obj.get("llm_eval")
     if not isinstance(llm_eval, dict):
         llm_eval = {}
@@ -316,7 +362,7 @@ def _load_json_config(path: Path) -> AuthConfig:
         probe_eval = {}
 
     if not base_url or not token or not uid or not email:
-        raise RuntimeError(f"缺少必填字段: base_url/token/uid/email, path={path.as_posix()}")
+        raise RuntimeError(f"缂哄皯蹇呭～瀛楁: base_url/token/uid/email, path={path.as_posix()}")
 
     return AuthConfig(
         base_url=base_url,
@@ -328,14 +374,16 @@ def _load_json_config(path: Path) -> AuthConfig:
         uid=uid,
         email=email,
         source_path=path,
+        selected_env=active_env,
         llm_eval=llm_eval,
         user_simulator=user_simulator,
         probe_eval=probe_eval,
     )
 
 
-def _load_text_config(path: Path) -> AuthConfig:
+def _load_text_config(path: Path, runtime_env: str) -> AuthConfig:
     text = path.read_text(encoding="utf-8", errors="ignore")
+    active_env = _normalize_env_name(runtime_env or os.getenv("AUTO_TEST_ENV", "") or "prod", "prod")
     base_url = _pick_text_value(text, "base_url").rstrip("/")
     dotai_base_url = _pick_text_value(text, "dotai_base_url").rstrip("/")
     proxy_http = _pick_text_value(text, "http_proxy")
@@ -345,7 +393,7 @@ def _load_text_config(path: Path) -> AuthConfig:
     uid = _pick_text_value(text, "uid")
     email = _pick_text_value(text, "email")
     if not base_url or not token or not uid or not email:
-        raise RuntimeError(f"缺少必填字段: base_url/token/uid/email, path={path.as_posix()}")
+        raise RuntimeError(f"缂哄皯蹇呭～瀛楁: base_url/token/uid/email, path={path.as_posix()}")
     return AuthConfig(
         base_url=base_url,
         dotai_base_url=dotai_base_url,
@@ -356,18 +404,19 @@ def _load_text_config(path: Path) -> AuthConfig:
         uid=uid,
         email=email,
         source_path=path,
+        selected_env=active_env,
         llm_eval={},
         user_simulator={},
         probe_eval={},
     )
 
 
-def load_config(path: Path) -> AuthConfig:
+def load_config(path: Path, runtime_env: str) -> AuthConfig:
     if not path.exists():
-        raise RuntimeError(f"配置文件不存在: {path.as_posix()}")
+        raise RuntimeError(f"閰嶇疆鏂囦欢涓嶅瓨鍦? {path.as_posix()}")
     if path.suffix.lower() == ".json":
-        return _load_json_config(path)
-    return _load_text_config(path)
+        return _load_json_config(path, runtime_env)
+    return _load_text_config(path, runtime_env)
 
 
 def normalize_authz(token: str) -> str:
@@ -448,6 +497,124 @@ def mask_token(token: str) -> str:
 
 def build_llm_eval_config(cfg: AuthConfig) -> LLMEvalConfig:
     llm_cfg = cfg.llm_eval if isinstance(cfg.llm_eval, dict) else {}
+    foundation_cfg = llm_cfg.get("foundation")
+    if not isinstance(foundation_cfg, dict):
+        foundation_cfg = {}
+    profile_cfg = llm_cfg.get("profile")
+    if not isinstance(profile_cfg, dict):
+        profile_cfg = {}
+    profiles_cfg = llm_cfg.get("profiles")
+    if not isinstance(profiles_cfg, dict):
+        profiles_cfg = {}
+
+    active_profile_name = str(
+        profile_cfg.get("active")
+        or os.getenv("AUTO_TEST_LLM_EVAL_PROFILE_ACTIVE", "memory_compression")
+    ).strip() or "memory_compression"
+    primary_mode = str(
+        llm_cfg.get("primary_mode")
+        or os.getenv("AUTO_TEST_LLM_EVAL_PRIMARY_MODE", "llm_v1")
+    ).strip().lower()
+    if primary_mode not in {"llm_v1", "foundation_v2", "final_v2"}:
+        primary_mode = "llm_v1"
+    active_profile_cfg = profiles_cfg.get(active_profile_name)
+    if not isinstance(active_profile_cfg, dict):
+        active_profile_cfg = {}
+
+    def _coerce_weight_map(raw: Any) -> dict[str, float]:
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, float] = {}
+        for key, value in raw.items():
+            name = str(key or "").strip()
+            if not name:
+                continue
+            out[name] = max(0.0, _cfg_float(value, 0.0))
+        return out
+
+    def _coerce_profile_name_list(raw: Any) -> list[str]:
+        names: list[str] = []
+        if isinstance(raw, str):
+            parts = raw.split(",")
+            for part in parts:
+                name = str(part or "").strip()
+                if name:
+                    names.append(name)
+        elif isinstance(raw, (list, tuple)):
+            for item in raw:
+                name = str(item or "").strip()
+                if name:
+                    names.append(name)
+        seen: set[str] = set()
+        normalized: list[str] = []
+        for name in names:
+            lower = name.lower()
+            if lower in seen:
+                continue
+            seen.add(lower)
+            normalized.append(name)
+        return normalized
+
+    def _coerce_profile_route_map(raw: Any) -> dict[str, list[str]]:
+        if not isinstance(raw, dict):
+            return {}
+        out: dict[str, list[str]] = {}
+        for key, value in raw.items():
+            mode = str(key or "").strip().lower()
+            if not mode:
+                continue
+            names = _coerce_profile_name_list(value)
+            if names:
+                out[mode] = names
+        return out
+
+    profile_enabled_global = _cfg_bool(
+        profile_cfg.get("enabled"),
+        _env_bool("AUTO_TEST_LLM_EVAL_PROFILE_ENABLED", True),
+    )
+    active_profile_enabled = _cfg_bool(
+        active_profile_cfg.get("enabled"),
+        _env_bool(
+            "AUTO_TEST_LLM_EVAL_PROFILE_ENABLED",
+            profile_enabled_global,
+        ),
+    )
+    active_profiles = _coerce_profile_name_list(profile_cfg.get("active_profiles"))
+    env_active_profiles = str(os.getenv("AUTO_TEST_LLM_EVAL_PROFILE_ACTIVE_PROFILES", "")).strip()
+    if env_active_profiles:
+        active_profiles = _coerce_profile_name_list(env_active_profiles)
+    if not active_profiles:
+        active_profiles = [active_profile_name]
+
+    route_map = _coerce_profile_route_map(profile_cfg.get("active_profiles_by_capability_mode"))
+    env_route_map = str(os.getenv("AUTO_TEST_LLM_EVAL_PROFILE_ROUTE_MAP_JSON", "")).strip()
+    if env_route_map:
+        parsed = _safe_json_loads(env_route_map)
+        if isinstance(parsed, dict):
+            route_map = _coerce_profile_route_map(parsed)
+
+    profile_weights_by_name: dict[str, dict[str, float]] = {}
+    profile_enabled_by_name: dict[str, bool] = {}
+    profile_merge_weights: dict[str, float] = {}
+    for name, raw in profiles_cfg.items():
+        profile_name = str(name or "").strip()
+        if not profile_name:
+            continue
+        profile_raw = raw if isinstance(raw, dict) else {}
+        profile_enabled_by_name[profile_name] = _cfg_bool(
+            profile_raw.get("enabled"),
+            profile_enabled_global,
+        )
+        profile_weights_by_name[profile_name] = _coerce_weight_map(profile_raw.get("weights"))
+        profile_merge_weights[profile_name] = max(0.0, _cfg_float(profile_raw.get("merge_weight"), 1.0))
+
+    if active_profile_name not in profile_enabled_by_name:
+        profile_enabled_by_name[active_profile_name] = active_profile_enabled
+    if active_profile_name not in profile_weights_by_name:
+        profile_weights_by_name[active_profile_name] = _coerce_weight_map(active_profile_cfg.get("weights"))
+    if active_profile_name not in profile_merge_weights:
+        profile_merge_weights[active_profile_name] = 1.0
+
     return LLMEvalConfig(
         enabled=_cfg_bool(
             llm_cfg.get("enabled"),
@@ -460,7 +627,233 @@ def build_llm_eval_config(cfg: AuthConfig) -> LLMEvalConfig:
             llm_cfg.get("timeout_sec"),
             _env_int("AUTO_TEST_EVAL_LLM_TIMEOUT_SEC", 30),
         ),
+        foundation_enabled=_cfg_bool(
+            foundation_cfg.get("enabled"),
+            _env_bool("AUTO_TEST_LLM_EVAL_FOUNDATION_ENABLED", True),
+        ),
+        foundation_weights=_coerce_weight_map(foundation_cfg.get("weights")),
+        profile_active=active_profile_name,
+        profile_active_profiles=active_profiles,
+        profile_active_profiles_by_capability_mode=route_map,
+        profile_enabled=active_profile_enabled,
+        profile_enabled_by_name=profile_enabled_by_name,
+        profile_weight=max(
+            0.0,
+            min(
+                1.0,
+                _cfg_float(
+                    profile_cfg.get("weight"),
+                    _env_float("AUTO_TEST_LLM_EVAL_PROFILE_WEIGHT", 0.35),
+                ),
+            ),
+        ),
+        profile_fallback_to_foundation_only=_cfg_bool(
+            profile_cfg.get("fallback_to_foundation_only"),
+            _env_bool("AUTO_TEST_LLM_EVAL_PROFILE_FALLBACK", True),
+        ),
+        profile_weights=_coerce_weight_map(active_profile_cfg.get("weights")),
+        profile_weights_by_name=profile_weights_by_name,
+        profile_merge_weights=profile_merge_weights,
+        shadow_pass_threshold_0_100=max(
+            0.0,
+            min(
+                100.0,
+                _cfg_float(
+                    llm_cfg.get("shadow_pass_threshold_0_100"),
+                    _env_float("AUTO_TEST_LLM_EVAL_SHADOW_THRESHOLD_0_100", 70.0),
+                ),
+            ),
+        ),
+        primary_mode=primary_mode,
     )
+
+
+def _normalize_primary_mode(raw: Any) -> str:
+    mode = str(raw or "").strip().lower()
+    if mode in {"llm_v1", "foundation_v2", "final_v2"}:
+        return mode
+    return "llm_v1"
+
+
+def _resolve_profile_router(llm_cfg: LLMEvalConfig, capability_mode: str) -> dict[str, Any]:
+    mode = str(capability_mode or "").strip().lower()
+    route_map = (
+        llm_cfg.profile_active_profiles_by_capability_mode
+        if isinstance(llm_cfg.profile_active_profiles_by_capability_mode, dict)
+        else {}
+    )
+    selected = route_map.get(mode)
+    source = "active_profiles_by_capability_mode" if isinstance(selected, list) and selected else "active_profiles"
+    if not isinstance(selected, list) or not selected:
+        selected = llm_cfg.profile_active_profiles if isinstance(llm_cfg.profile_active_profiles, list) else []
+    if not selected:
+        selected = [llm_cfg.profile_active]
+
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for item in selected:
+        name = str(item or "").strip()
+        if not name:
+            continue
+        lower = name.lower()
+        if lower in seen:
+            continue
+        seen.add(lower)
+        normalized.append(name)
+    if not normalized:
+        normalized = [str(llm_cfg.profile_active or "memory_compression").strip() or "memory_compression"]
+
+    return {
+        "source": source,
+        "capability_mode": mode,
+        "selected_profiles": normalized,
+    }
+
+
+def _to_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _to_float(value: Any, default: float = 0.0) -> float:
+    if isinstance(value, bool):
+        return float(int(value))
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return default
+        try:
+            return float(raw)
+        except Exception:
+            return default
+    return default
+
+
+def _build_primary_evaluation(llm_eval: dict[str, Any], llm_cfg: LLMEvalConfig) -> dict[str, Any]:
+    mode = _normalize_primary_mode(llm_cfg.primary_mode)
+    response_json = llm_eval.get("response_json")
+    if not isinstance(response_json, dict):
+        response_json = {}
+    shadow = llm_eval.get("evaluation_v2_shadow")
+    if not isinstance(shadow, dict):
+        shadow = {}
+
+    if mode == "foundation_v2":
+        foundation = shadow.get("foundation")
+        if not isinstance(foundation, dict):
+            foundation = {}
+        score_0_100 = round(max(0.0, min(100.0, _to_float(foundation.get("score"), 0.0) * 100.0)), 2)
+        threshold_0_100 = round(max(0.0, min(100.0, _to_float(llm_cfg.shadow_pass_threshold_0_100, 70.0))), 2)
+        return {
+            "mode": mode,
+            "source": "evaluation_v2_shadow.foundation",
+            "pass": score_0_100 >= threshold_0_100,
+            "score_0_100": score_0_100,
+            "threshold_0_100": threshold_0_100,
+        }
+
+    if mode == "final_v2":
+        final = shadow.get("final")
+        if not isinstance(final, dict):
+            final = {}
+        score_0_100 = round(max(0.0, min(100.0, _to_float(final.get("score_0_100"), 0.0))), 2)
+        threshold_0_100 = round(max(0.0, min(100.0, _to_float(final.get("threshold_0_100"), 70.0))), 2)
+        return {
+            "mode": mode,
+            "source": "evaluation_v2_shadow.final",
+            "pass": _to_bool(final.get("pass"), score_0_100 >= threshold_0_100),
+            "score_0_100": score_0_100,
+            "threshold_0_100": threshold_0_100,
+        }
+
+    score_0_100 = round(max(0.0, min(100.0, _to_float(response_json.get("score_0_100"), 0.0))), 2)
+    return {
+        "mode": "llm_v1",
+        "source": "llm_evaluation.response_json",
+        "pass": _to_bool(response_json.get("pass"), False),
+        "score_0_100": score_0_100,
+        "threshold_0_100": None,
+    }
+
+
+def _build_evaluation_compare(
+    llm_eval: dict[str, Any],
+    llm_cfg: LLMEvalConfig,
+    evaluation_primary: dict[str, Any],
+) -> dict[str, Any]:
+    response_json = llm_eval.get("response_json")
+    if not isinstance(response_json, dict):
+        response_json = {}
+    shadow = llm_eval.get("evaluation_v2_shadow")
+    if not isinstance(shadow, dict):
+        shadow = {}
+
+    threshold_0_100 = round(max(0.0, min(100.0, _to_float(llm_cfg.shadow_pass_threshold_0_100, 70.0))), 2)
+
+    llm_score = round(max(0.0, min(100.0, _to_float(response_json.get("score_0_100"), 0.0))), 2)
+    llm_pass = _to_bool(response_json.get("pass"), False)
+    llm_available = bool(response_json)
+
+    foundation = shadow.get("foundation")
+    if not isinstance(foundation, dict):
+        foundation = {}
+    foundation_score = round(max(0.0, min(100.0, _to_float(foundation.get("score"), 0.0) * 100.0)), 2)
+    foundation_available = bool(foundation)
+    foundation_pass = foundation_score >= threshold_0_100
+
+    final = shadow.get("final")
+    if not isinstance(final, dict):
+        final = {}
+    final_score = round(max(0.0, min(100.0, _to_float(final.get("score_0_100"), 0.0))), 2)
+    final_threshold = round(max(0.0, min(100.0, _to_float(final.get("threshold_0_100"), threshold_0_100))), 2)
+    final_available = bool(final)
+    final_pass = _to_bool(final.get("pass"), final_score >= final_threshold)
+
+    def _delta(left: float, left_ok: bool, right: float, right_ok: bool) -> float | None:
+        if not (left_ok and right_ok):
+            return None
+        return round(left - right, 2)
+
+    return {
+        "primary_mode": str(evaluation_primary.get("mode") or _normalize_primary_mode(llm_cfg.primary_mode)),
+        "llm_v1": {
+            "available": llm_available,
+            "pass": llm_pass if llm_available else None,
+            "score_0_100": llm_score if llm_available else None,
+            "threshold_0_100": None,
+            "source": "llm_evaluation.response_json",
+        },
+        "foundation_v2": {
+            "available": foundation_available,
+            "pass": foundation_pass if foundation_available else None,
+            "score_0_100": foundation_score if foundation_available else None,
+            "threshold_0_100": threshold_0_100 if foundation_available else None,
+            "source": "evaluation_v2_shadow.foundation",
+        },
+        "final_v2": {
+            "available": final_available,
+            "pass": final_pass if final_available else None,
+            "score_0_100": final_score if final_available else None,
+            "threshold_0_100": final_threshold if final_available else None,
+            "source": "evaluation_v2_shadow.final",
+        },
+        "delta": {
+            "foundation_minus_llm_v1": _delta(foundation_score, foundation_available, llm_score, llm_available),
+            "final_minus_foundation": _delta(final_score, final_available, foundation_score, foundation_available),
+            "final_minus_llm_v1": _delta(final_score, final_available, llm_score, llm_available),
+        },
+    }
 
 
 def _ensure_required_note_clear_text(text: str) -> str:
@@ -488,7 +881,7 @@ def build_user_simulator_config(cfg: AuthConfig, llm_eval_cfg: LLMEvalConfig) ->
     target_intent_pool = _trim_prompt_text(
         _load_optional_text(
             target_dir / "scenarios" / "intent_pool.yaml",
-            "- 需求澄清\n- 文案创作\n- 图片生成\n- 方案追问\n- 发布整理\n- 总结验收",
+            "- 闇€姹傛緞娓匼n- 鏂囨鍒涗綔\n- 鍥剧墖鐢熸垚\n- 鏂规杩介棶\n- 鍙戝竷鏁寸悊\n- 鎬荤粨楠屾敹",
         )
     )
     target_policies = _trim_prompt_text(
@@ -505,11 +898,11 @@ def build_user_simulator_config(cfg: AuthConfig, llm_eval_cfg: LLMEvalConfig) ->
     )
     industry_options = str(
         sim_cfg.get("industry_options")
-        or "餐饮、零售、教育、医疗、制造、跨境电商、本地生活、SaaS"
+        or "椁愰ギ銆侀浂鍞€佹暀鑲层€佸尰鐤椼€佸埗閫犮€佽法澧冪數鍟嗐€佹湰鍦扮敓娲汇€丼aaS"
     ).strip()
     identity_options = str(
         sim_cfg.get("identity_options")
-        or "老板、运营负责人、市场负责人、产品经理、区域代理、采购负责人"
+        or "鑰佹澘銆佽繍钀ヨ礋璐ｄ汉銆佸競鍦鸿礋璐ｄ汉銆佷骇鍝佺粡鐞嗐€佸尯鍩熶唬鐞嗐€侀噰璐礋璐ｄ汉"
     ).strip()
     personas_dir = target_dir / "personas"
     personas_file = personas_dir / f"{target_name}_users.json"
@@ -534,44 +927,44 @@ def build_user_simulator_config(cfg: AuthConfig, llm_eval_cfg: LLMEvalConfig) ->
     )
 
     default_system_prompt = (
-        "你是自动化测试中的“用户模拟器”。"
-        "你的任务是基于当前角色与历史对话，生成下一轮用户输入。"
-        "你必须只返回 JSON，对象字段包含：user_text, stop, reason。"
-        "其中 user_text 必须是自然语言请求，不要输出解释。"
+        "You are the user simulator in an automated test. "
+        "Generate the next user input based on the role and conversation history. "
+        "Return JSON only with fields: user_text, stop, reason. "
+        "user_text must be natural language and must not include explanations."
     )
     default_scenario_prompt = (
-        "你在扮演目标智能体的真实客户，与助手进行多轮协作。\n"
-        "目标名称：{{TARGET_NAME}}\n\n"
-        "目标能力边界与策略（来自 target policies）：\n"
+        "You are role-playing a realistic customer for the target assistant.\n"
+        "Target name: {{TARGET_NAME}}\n\n"
+        "Target policies:\n"
         "{{TARGET_POLICIES}}\n\n"
-        "目标意图池（来自 target intent pool）：\n"
+        "Target intent pool:\n"
         "{{TARGET_INTENT_POOL}}\n\n"
-        "探针评分参考（可选）：\n"
+        "Probe rubrics (optional):\n"
         "{{TARGET_RUBRICS}}\n\n"
-        "随机化要求：\n"
-        "1. 每轮选择一个主意图，不固定顺序。\n"
-        "2. 每轮要有可执行交付或明确追问。\n"
-        "3. 语气随机（正式/口语/追问/质疑），长度随机（10~100字）。\n"
-        "4. 不要重复上一轮用户句式。\n\n"
-        "轮次上限：{{MAX_TURNS}}。仅在你认为目标完成时再 stop=true。"
+        "Randomization constraints:\n"
+        "1. Pick one main intent each turn; avoid fixed ordering.\n"
+        "2. Each turn should request a concrete deliverable or a clear follow-up.\n"
+        "3. Vary tone and length naturally.\n"
+        "4. Avoid repeating the previous user sentence pattern.\n\n"
+        "Turn limit: {{MAX_TURNS}}. Set stop=true only when the goal is complete."
     )
     default_role_system_prompt = (
-        "你是测试数据设计器，专门生成“可扮演的随机客户角色”。"
-        "请只返回 JSON，不要输出解释。"
+        "You are a test-data designer that generates a role-playable random customer persona. "
+        "Return JSON only, without explanations."
     )
     default_role_user_prompt = (
-        "请生成一个用于多轮对话测试的随机客户角色。\n"
-        "目标名称：{{TARGET_NAME}}\n"
-        "目标能力边界（供参考）：\n{{TARGET_POLICIES}}\n\n"
-        "可选用户画像样本（可借鉴但禁止照抄）：\n{{TARGET_PERSONAS}}\n\n"
-        "约束信息：\n"
-        "- 本轮最大对话数：{{MAX_TURNS}}\n"
-        "- 首轮固定用户动作：{{REQUIRED_NOTEBOOK_CLEAR_TEXT}}\n\n"
-        "要求：\n"
-        "1. 角色要有真实业务背景与沟通风格。\n"
-        "2. 必须包含冲突约束（例如预算、时效、合规、调性冲突）。\n"
-        "3. 尽量避免与常见模板同质化。\n\n"
-        "输出 JSON 字段：\n"
+        "璇风敓鎴愪竴涓敤浜庡杞璇濇祴璇曠殑闅忔満瀹㈡埛瑙掕壊銆俓n"
+        "鐩爣鍚嶇О锛歿{TARGET_NAME}}\n"
+        "鐩爣鑳藉姏杈圭晫锛堜緵鍙傝€冿級锛歕n{{TARGET_POLICIES}}\n\n"
+        "鍙€夌敤鎴风敾鍍忔牱鏈紙鍙€熼壌浣嗙姝㈢収鎶勶級锛歕n{{TARGET_PERSONAS}}\n\n"
+        "绾︽潫淇℃伅锛歕n"
+        "- 鏈疆鏈€澶у璇濇暟锛歿{MAX_TURNS}}\n"
+        "- 棣栬疆鍥哄畾鐢ㄦ埛鍔ㄤ綔锛歿{REQUIRED_NOTEBOOK_CLEAR_TEXT}}\n\n"
+        "瑕佹眰锛歕n"
+        "1. 瑙掕壊瑕佹湁鐪熷疄涓氬姟鑳屾櫙涓庢矡閫氶鏍笺€俓n"
+        "2. 蹇呴』鍖呭惈鍐茬獊绾︽潫锛堜緥濡傞绠椼€佹椂鏁堛€佸悎瑙勩€佽皟鎬у啿绐侊級銆俓n"
+        "3. 灏介噺閬垮厤涓庡父瑙佹ā鏉垮悓璐ㄥ寲銆俓n\n"
+        "杈撳嚭 JSON 瀛楁锛歕n"
         "- role_name\n"
         "- identity\n"
         "- business_background\n"
@@ -722,11 +1115,11 @@ def create_session(
     payload = resp.json()
     code = payload.get("code")
     if code not in (0, 200):
-        raise RuntimeError(f"create_session 业务错误: {payload}")
+        raise RuntimeError(f"create_session 涓氬姟閿欒: {payload}")
 
     session_id = ((payload.get("data") or {}).get("sessionId") or "").strip()
     if not session_id:
-        raise RuntimeError(f"create_session 缺少 sessionId: {payload}")
+        raise RuntimeError(f"create_session 缂哄皯 sessionId: {payload}")
     return session_id, trace
 
 
@@ -1084,37 +1477,37 @@ def build_run_settings() -> dict[str, Any]:
 def build_persist_type() -> int:
     persist_type = _env_int("AUTO_TEST_PERSIST_TYPE", 0)
     if persist_type not in (0, 1, 2):
-        raise RuntimeError("AUTO_TEST_PERSIST_TYPE 仅支持 0(db) / 1(cache) / 2(one-shot)")
+        raise RuntimeError("AUTO_TEST_PERSIST_TYPE 浠呮敮鎸?0(db) / 1(cache) / 2(one-shot)")
     return persist_type
 
 
 def build_exec_max_turns() -> int:
     max_turns = _env_int("AUTO_TEST_EXEC_MAX_TURNS", 8)
     if max_turns < 1 or max_turns > 128:
-        raise RuntimeError("AUTO_TEST_EXEC_MAX_TURNS 需在 1~128 之间")
+        raise RuntimeError("AUTO_TEST_EXEC_MAX_TURNS 闇€鍦?1~128 涔嬮棿")
     return max_turns
 
 
 def build_create_settings_json(run_settings: dict[str, Any]) -> str | None:
     import os
 
-    # 优先使用显式配置；用于对齐前端“会话创建即保存 settings”的路径。
+    # 浼樺厛浣跨敤鏄惧紡閰嶇疆锛涚敤浜庡榻愬墠绔€滀細璇濆垱寤哄嵆淇濆瓨 settings鈥濈殑璺緞銆?
     raw = os.getenv("AUTO_TEST_CREATE_SETTINGS_JSON", "").strip()
     if raw:
         custom = _safe_json_loads(raw)
         if not isinstance(custom, dict):
-            raise RuntimeError("AUTO_TEST_CREATE_SETTINGS_JSON 必须是 JSON 对象")
+            raise RuntimeError("AUTO_TEST_CREATE_SETTINGS_JSON 蹇呴』鏄?JSON 瀵硅薄")
         return json.dumps(custom, ensure_ascii=False, sort_keys=True)
 
-    # 默认把 runSettings 同步到 create_session.settings，避免 skillIds 只传 execute_session
-    # 但未进入初始系统 prompt 的情况。
+    # 榛樿鎶?runSettings 鍚屾鍒?create_session.settings锛岄伩鍏?skillIds 鍙紶 execute_session
+    # 浣嗘湭杩涘叆鍒濆绯荤粺 prompt 鐨勬儏鍐点€?
     if _env_bool("AUTO_TEST_CREATE_SETTINGS_FROM_RUN_SETTINGS", True):
         return json.dumps(run_settings, ensure_ascii=False, sort_keys=True)
     return None
 
 
 def build_expected_facts() -> dict[str, str]:
-    # LLM-only 模式下不再绑定固定事实集合。
+    # LLM-only mode no longer binds to fixed expected-facts assertions.
     return {}
 
 
@@ -1208,7 +1601,7 @@ def write_meta_md(
 ) -> None:
     ok_turns = sum(1 for r in results if r.get("run_end") and not r.get("run_error"))
     lines = [
-        "# 对话测试元信息",
+        "# Dialogue Test Metadata",
         "",
         f"- run_id: `{run_id}`",
         f"- session_id: `{session_id}`",
@@ -1219,6 +1612,7 @@ def write_meta_md(
         f"- uid: `{cfg.uid}`",
         f"- email: `{cfg.email}`",
         f"- token(masked): `{mask_token(cfg.token)}`",
+        f"- runtime_env: `{cfg.selected_env}`",
         f"- config_source: `{cfg.source_path.as_posix()}`",
         f"- created_at: `{datetime.now().isoformat(timespec='seconds')}`",
         f"- user_simulator_enabled: `{user_sim_cfg.enabled}`",
@@ -1263,9 +1657,9 @@ def write_meta_md(
             "",
             f"- success_turns: `{ok_turns}/{len(results)}`",
             "",
-            "## 追踪字段说明",
+            "## 杩借釜瀛楁璇存槑",
             "",
-            "- trace 来源于后端响应头，不在客户端自造 trace id。",
+            "- Trace IDs come from backend response headers, not a client-side generated trace id.",
         ]
     )
 
@@ -1323,7 +1717,7 @@ def write_meta_md(
 
 
 def write_dialogue_md(path: Path, results: list[dict[str, Any]]) -> None:
-    lines = ["# 用户视角对话记录", ""]
+    lines = ["# 鐢ㄦ埛瑙嗚瀵硅瘽璁板綍", ""]
     for result in results:
         lines.extend(
             [
@@ -1341,10 +1735,11 @@ def write_dialogue_md(path: Path, results: list[dict[str, Any]]) -> None:
 def main() -> int:
     args = parse_runtime_args(sys.argv[1:])
     cfg_path = resolve_config_path()
-    cfg = load_config(cfg_path)
+    cfg = load_config(cfg_path, args.env)
     applied_proxy = apply_proxy_from_config(cfg)
     dotai_base_url = resolve_dotai_base_url(cfg)
     print(f"[INFO] config_path={cfg.source_path.as_posix()}")
+    print(f"[INFO] runtime_env={cfg.selected_env}")
 
     run_id = f"{now_stamp()}_{uuid.uuid4().hex[:8]}"
     result_dir = AUTO_TEST_DIR / "results" / f"session_autotest_{run_id}"
@@ -1371,6 +1766,9 @@ def main() -> int:
     llm_eval_cfg = build_llm_eval_config(cfg)
     probe_eval_cfg = build_probe_eval_config(cfg)
     user_sim_cfg = build_user_simulator_config(cfg, llm_eval_cfg)
+    profile_router = _resolve_profile_router(llm_eval_cfg, user_sim_cfg.capability_mode)
+    llm_eval_cfg.profile_active_profiles = profile_router.get("selected_profiles", llm_eval_cfg.profile_active_profiles)
+    llm_eval_cfg.profile_router_context = profile_router
     persist_type = build_persist_type()
     exec_max_turns = build_exec_max_turns()
     create_settings_json = build_create_settings_json(run_settings)
@@ -1395,6 +1793,16 @@ def main() -> int:
     if llm_eval_cfg.enabled:
         print(f"[INFO] llm_eval_url={llm_eval_cfg.base_url}")
         print(f"[INFO] llm_eval_model={llm_eval_cfg.model}")
+        print(
+            "[INFO] llm_eval_v2_shadow "
+            f"primary_mode={llm_eval_cfg.primary_mode} "
+            f"foundation_enabled={llm_eval_cfg.foundation_enabled} "
+            f"profile={llm_eval_cfg.profile_active} "
+            f"profiles={llm_eval_cfg.profile_active_profiles} "
+            f"profile_route_source={profile_router.get('source')} "
+            f"profile_enabled={llm_eval_cfg.profile_enabled} "
+            f"profile_weight={llm_eval_cfg.profile_weight}"
+        )
     print(f"[INFO] probe_eval_enabled={probe_eval_cfg.enabled}")
     print(f"[INFO] probe_eval_dataset={probe_eval_cfg.dataset_path.as_posix()}")
     print(
@@ -1416,13 +1824,13 @@ def main() -> int:
         print(f"[INFO] override max_turns from CLI: {user_sim_cfg.max_turns}")
 
     if not user_sim_cfg.enabled:
-        raise RuntimeError("已启用 LLM 全量模式：请在 config.user_simulator.enabled=true 后重试。")
+        raise RuntimeError("LLM-only mode requires config.user_simulator.enabled=true.")
     if not user_sim_cfg.base_url or not user_sim_cfg.model or not user_sim_cfg.api_key:
-        raise RuntimeError("user_simulator 配置不完整：需要 base_url/model/api_key。")
+        raise RuntimeError("Incomplete user_simulator config: base_url/model/api_key are required.")
     if not llm_eval_cfg.enabled:
-        raise RuntimeError("已启用 LLM 全量模式：请在 config.llm_eval.enabled=true 后重试。")
+        raise RuntimeError("LLM-only mode requires config.llm_eval.enabled=true.")
     if not llm_eval_cfg.base_url or not llm_eval_cfg.model or not llm_eval_cfg.api_key:
-        raise RuntimeError("llm_eval 配置不完整：需要 base_url/model/api_key。")
+        raise RuntimeError("Incomplete llm_eval config: base_url/model/api_key are required.")
 
     result_dir.mkdir(parents=True, exist_ok=True)
     run_data_dir.mkdir(parents=True, exist_ok=True)
@@ -1463,7 +1871,7 @@ def main() -> int:
                         print(f"[INFO] user_simulator requested stop at turn={idx}")
                         break
                 except Exception as exc:
-                    raise RuntimeError(f"user_simulator turn={idx} 生成失败: {exc}") from exc
+                    raise RuntimeError(f"user_simulator turn={idx} 鐢熸垚澶辫触: {exc}") from exc
 
             print(f"[INFO] turn={idx}")
             one = execute_turn(
@@ -1596,29 +2004,49 @@ def main() -> int:
         llm_cfg=llm_eval_cfg,
     )
     if llm_eval.get("skipped") or llm_eval.get("error"):
-        raise RuntimeError(f"LLM 评估失败: {llm_eval.get('reason') or llm_eval.get('error')}")
+        raise RuntimeError(f"LLM 璇勪及澶辫触: {llm_eval.get('reason') or llm_eval.get('error')}")
+
+    evaluation_payload: dict[str, Any] = {
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "evaluation_mode": "llm_only",
+        "llm_evaluation": llm_eval,
+    }
+    evaluation_v2_shadow = llm_eval.get("evaluation_v2_shadow")
+    if isinstance(evaluation_v2_shadow, dict):
+        evaluation_payload["evaluation_v2_shadow"] = evaluation_v2_shadow
+        if _normalize_primary_mode(llm_eval_cfg.primary_mode) != "llm_v1":
+            evaluation_payload["evaluation_v2"] = evaluation_v2_shadow
+    evaluation_primary = _build_primary_evaluation(llm_eval, llm_eval_cfg)
+    evaluation_payload["evaluation_primary"] = evaluation_primary
+    evaluation_compare = _build_evaluation_compare(llm_eval, llm_eval_cfg, evaluation_primary)
+    evaluation_payload["evaluation_compare"] = evaluation_compare
 
     (run_data_dir / "evaluation.json").write_text(
         json.dumps(
-            {
-                "generated_at": datetime.now().isoformat(timespec="seconds"),
-                "evaluation_mode": "llm_only",
-                "llm_evaluation": llm_eval,
-            },
+            evaluation_payload,
             ensure_ascii=False,
             indent=2,
         )
         + "\n",
         encoding="utf-8",
     )
-    write_evaluation_md(result_dir / "evaluation.md", rule_eval=None, llm_eval=llm_eval)
+    write_evaluation_md(
+        result_dir / "evaluation.md",
+        rule_eval=None,
+        llm_eval=llm_eval,
+        evaluation_primary=evaluation_primary,
+        evaluation_compare=evaluation_compare,
+    )
 
     (run_data_dir / "README.md").write_text(
-        "# run_data 结构说明\n\n"
-        "- `turn_results.json`: 每轮结构化结果。\n"
-        "- `evaluation.json`: LLM-only 评估结果。\n"
-        "- `probe_results.json`: 探针评估结构化结果（启用 `AUTO_TEST_ENABLE_PROBE_EVAL=true` 时生成；支持 deterministic + llm judge）。\n"
-        "- `../workspace/`: 用户可见工作区导出（含 `_manifest.json` 与文件落盘结果）。\n",
+        "# run_data 缁撴瀯璇存槑\n\n"
+        "- `turn_results.json`: 姣忚疆缁撴瀯鍖栫粨鏋溿€俓n"
+        "- `evaluation.json`: LLM-only 璇勪及缁撴灉锛堝惈 `evaluation_v2_shadow` 褰卞瓙缁撴瀯锛夈€俓n"
+        "- `evaluation.json.evaluation_primary`: 褰撳墠涓诲垽瀹氱粨鏋滐紙鍙厤缃?`llm_v1/foundation_v2/final_v2`锛夈€俓n"
+        "- `evaluation.json.evaluation_compare`: `llm_v1/foundation_v2/final_v2` A/B compare and score deltas.\n"
+        "- `evaluation.json.evaluation_v2_shadow.profile_combined`: Phase D multi-profile merged score view.\n"
+        "- `probe_results.json`: 鎺㈤拡璇勪及缁撴瀯鍖栫粨鏋滐紙鍚敤 `AUTO_TEST_ENABLE_PROBE_EVAL=true` 鏃剁敓鎴愶紱鏀寔 deterministic + llm judge锛夈€俓n"
+        "- `../workspace/`: 鐢ㄦ埛鍙宸ヤ綔鍖哄鍑猴紙鍚?`_manifest.json` 涓庢枃浠惰惤鐩樼粨鏋滐級銆俓n",
         encoding="utf-8",
     )
 
@@ -1630,7 +2058,31 @@ def main() -> int:
             f"pass={response_json.get('pass')} "
             f"score_0_100={response_json.get('score_0_100')}"
         )
+    shadow_summary = ""
+    if isinstance(evaluation_v2_shadow, dict):
+        final = evaluation_v2_shadow.get("final")
+        if isinstance(final, dict):
+            shadow_summary = (
+                f"shadow_score_0_100={final.get('score_0_100')} "
+                f"shadow_pass={final.get('pass')}"
+            )
     print(f"[INFO] evaluation llm_only {llm_summary}".strip())
+    print(
+        "[INFO] evaluation_primary "
+        f"mode={evaluation_primary.get('mode')} "
+        f"pass={evaluation_primary.get('pass')} "
+        f"score_0_100={evaluation_primary.get('score_0_100')}"
+    )
+    if shadow_summary:
+        print(f"[INFO] evaluation_v2_shadow {shadow_summary}".strip())
+    compare_delta = evaluation_compare.get("delta") if isinstance(evaluation_compare, dict) else None
+    if isinstance(compare_delta, dict):
+        print(
+            "[INFO] evaluation_compare "
+            f"foundation_minus_llm_v1={compare_delta.get('foundation_minus_llm_v1')} "
+            f"final_minus_foundation={compare_delta.get('final_minus_foundation')} "
+            f"final_minus_llm_v1={compare_delta.get('final_minus_llm_v1')}"
+        )
     print(f"[INFO] done: success_turns={ok_turns}/{len(results)}")
     print(f"[INFO] outputs: {result_dir.as_posix()}")
     return 0

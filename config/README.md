@@ -27,6 +27,16 @@
 - `llm_eval.model`: 评估模型名（如 `gpt-5.3-codex`）
 - `llm_eval.api_key`: 评估模型 API Key
 - `llm_eval.timeout_sec`: 评估请求超时（秒）
+- `llm_eval.primary_mode`: 主判定模式（`llm_v1` / `foundation_v2` / `final_v2`，当前建议 `foundation_v2`）
+- `llm_eval.shadow_pass_threshold_0_100`: `evaluation_v2_shadow` 的通过阈值（0-100，默认 `70`）
+- `llm_eval.foundation.enabled`: 是否启用“通用评估底盘（影子模式）”
+- `llm_eval.foundation.weights`: 底盘维度权重（`task_completion/instruction_following/coherence/safety/tool_correctness`）
+- `llm_eval.profile.active`: 激活的 profile 名称（默认 `memory_compression`）
+- `llm_eval.profile.enabled`: 是否启用激活 profile（影子模式）
+- `llm_eval.profile.weight`: profile 融合权重（0-1，默认 `0.35`）
+- `llm_eval.profile.fallback_to_foundation_only`: profile 不可用时是否回退到底盘分
+- `llm_eval.profiles.<name>.enabled`: 某个 profile 是否启用（建议先配置 `memory_compression`）
+- `llm_eval.profiles.<name>.weights`: profile 内部维度权重（`memory_recall/compression_fidelity/state_continuity`）
 - `user_simulator.enabled`: 是否启用“模型扮演客户”模式
 - `user_simulator.mode`: 上下文模式，默认 `provider_context`（可选：`provider_context` / `explicit_context`）
 - `user_simulator.target_name`: 目标配置名（默认 `advoo`，对应 `prompts/targets/<target_name>/`）
@@ -71,6 +81,10 @@
 - 环境变量若已存在（如 `HTTP_PROXY`），会优先于配置中的代理值。
 - LLM 评估优先读取 `llm_eval` 配置；未配置字段会回退到环境变量。
 - 兼容环境变量：`AUTO_TEST_ENABLE_LLM_EVAL`、`AUTO_TEST_EVAL_LLM_URL`、`AUTO_TEST_EVAL_LLM_MODEL`、`AUTO_TEST_EVAL_LLM_API_KEY`、`AUTO_TEST_EVAL_LLM_TIMEOUT_SEC`。
+- `evaluation_v2_shadow` 为影子评估结构：当前不替代旧字段，只用于并行观察“底盘 + profile”评分结果。
+- `evaluation_primary` 为主判定结果：由 `llm_eval.primary_mode` 指定来源（Phase B 推荐 `foundation_v2`）。
+- 影子模式可通过环境变量覆盖：`AUTO_TEST_LLM_EVAL_FOUNDATION_ENABLED`、`AUTO_TEST_LLM_EVAL_PROFILE_ACTIVE`、`AUTO_TEST_LLM_EVAL_PROFILE_ENABLED`、`AUTO_TEST_LLM_EVAL_PROFILE_WEIGHT`、`AUTO_TEST_LLM_EVAL_PROFILE_FALLBACK`、`AUTO_TEST_LLM_EVAL_SHADOW_THRESHOLD_0_100`。
+- 主判定模式也可通过环境变量覆盖：`AUTO_TEST_LLM_EVAL_PRIMARY_MODE`。
 - 用户模拟优先读取 `user_simulator` 配置；未配置字段会回退到 `AUTO_TEST_USER_SIM_*` 环境变量，最后回退到 `llm_eval` 同名字段。
 - 可用环境变量 `AUTO_TEST_USER_SIM_CAPABILITY_MODE` 覆盖能力考核模式。
 - 用户模拟默认从 `prompts/framework/simulator/...` 读取通用模板，并注入 `prompts/targets/<target_name>/...` 的目标上下文。
@@ -156,3 +170,47 @@
   - `results/<run>/probe_evaluation.md`
 - 说明：
   - 若数据集中存在 `judge_mode=llm`，但未启用 LLM 裁判，则该类探针会记为 `skipped`。
+
+### Phase C Add-on
+
+Result payload now includes `evaluation_compare` for A/B comparison across `llm_v1`, `foundation_v2`, and `final_v2`.
+This does not replace `evaluation_primary`; it complements it for observability.
+
+### Phase D Add-on
+
+New profile config fields:
+- `llm_eval.profile.active_profiles`: default selected profiles list
+- `llm_eval.profile.active_profiles_by_capability_mode`: route map by simulator capability mode
+- `llm_eval.profiles.<name>.merge_weight`: per-profile weight inside multi-profile merge
+
+New shadow output fields:
+- `evaluation_v2_shadow.profile_router`
+- `evaluation_v2_shadow.profile_combined`
+- `evaluation_v2_shadow.profiles`
+
+---
+
+## Environment Switch (prod/test)
+
+- Default runtime environment is `prod`.
+- You can switch environment in two ways:
+  1. CLI: `python auto_test/src/tests/run_5turn_session_test.py --env test`
+  2. Env var: `AUTO_TEST_ENV=test`
+- Priority:
+  1. `--env`
+  2. `AUTO_TEST_ENV`
+  3. `config.active_env`
+  4. fallback `prod`
+
+Config schema (JSON):
+
+- `active_env`: default environment name (`prod`/`test`)
+- `environments.prod`: env-specific `base_url` / `dotai_base_url` / `auth`
+- `environments.test`: env-specific `base_url` / `dotai_base_url` / `auth`
+
+Compatibility note:
+
+- If `environments` is missing, loader falls back to old flat fields:
+  - `base_url`
+  - `dotai_base_url`
+  - `auth`

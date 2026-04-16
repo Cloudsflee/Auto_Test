@@ -3,11 +3,13 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import requests
+
+from .score_orchestrator import build_evaluation_v2_shadow
 
 
 @dataclass
@@ -17,6 +19,21 @@ class LLMEvalConfig:
     model: str
     api_key: str
     timeout_sec: int
+    foundation_enabled: bool = True
+    foundation_weights: dict[str, float] = field(default_factory=dict)
+    profile_active: str = "memory_compression"
+    profile_active_profiles: list[str] = field(default_factory=list)
+    profile_active_profiles_by_capability_mode: dict[str, list[str]] = field(default_factory=dict)
+    profile_enabled: bool = True
+    profile_enabled_by_name: dict[str, bool] = field(default_factory=dict)
+    profile_weight: float = 0.35
+    profile_fallback_to_foundation_only: bool = True
+    profile_weights: dict[str, float] = field(default_factory=dict)
+    profile_weights_by_name: dict[str, dict[str, float]] = field(default_factory=dict)
+    profile_merge_weights: dict[str, float] = field(default_factory=dict)
+    profile_router_context: dict[str, Any] = field(default_factory=dict)
+    shadow_pass_threshold_0_100: float = 70.0
+    primary_mode: str = "llm_v1"
 
 
 def _env_bool(key: str, default: bool = False) -> bool:
@@ -32,6 +49,16 @@ def _env_int(key: str, default: int) -> int:
         return default
     try:
         return int(raw)
+    except Exception:
+        return default
+
+
+def _env_float(key: str, default: float) -> float:
+    raw = os.getenv(key, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
     except Exception:
         return default
 
@@ -59,12 +86,25 @@ def _get_turn_result(results: list[dict[str, Any]], turn_idx: int) -> dict[str, 
 
 
 def load_llm_eval_config_from_env() -> LLMEvalConfig:
+    primary_mode = os.getenv("AUTO_TEST_LLM_EVAL_PRIMARY_MODE", "llm_v1").strip().lower()
+    if primary_mode not in {"llm_v1", "foundation_v2", "final_v2"}:
+        primary_mode = "llm_v1"
+    active_profiles_raw = os.getenv("AUTO_TEST_LLM_EVAL_PROFILE_ACTIVE_PROFILES", "").strip()
+    active_profiles = [part.strip() for part in active_profiles_raw.split(",") if part.strip()] if active_profiles_raw else []
     return LLMEvalConfig(
         enabled=_env_bool("AUTO_TEST_ENABLE_LLM_EVAL", False),
         base_url=os.getenv("AUTO_TEST_EVAL_LLM_URL", "").strip(),
         model=os.getenv("AUTO_TEST_EVAL_LLM_MODEL", "").strip(),
         api_key=os.getenv("AUTO_TEST_EVAL_LLM_API_KEY", "").strip(),
         timeout_sec=_env_int("AUTO_TEST_EVAL_LLM_TIMEOUT_SEC", 30),
+        foundation_enabled=_env_bool("AUTO_TEST_LLM_EVAL_FOUNDATION_ENABLED", True),
+        profile_active=os.getenv("AUTO_TEST_LLM_EVAL_PROFILE_ACTIVE", "memory_compression").strip() or "memory_compression",
+        profile_active_profiles=active_profiles,
+        profile_enabled=_env_bool("AUTO_TEST_LLM_EVAL_PROFILE_ENABLED", True),
+        profile_weight=_env_float("AUTO_TEST_LLM_EVAL_PROFILE_WEIGHT", 0.35),
+        profile_fallback_to_foundation_only=_env_bool("AUTO_TEST_LLM_EVAL_PROFILE_FALLBACK", True),
+        shadow_pass_threshold_0_100=_env_float("AUTO_TEST_LLM_EVAL_SHADOW_THRESHOLD_0_100", 70.0),
+        primary_mode=primary_mode,
     )
 
 
@@ -424,6 +464,24 @@ def evaluate_with_llm(
         content_type = (resp.headers.get("Content-Type") or "").lower()
         payload, content = _parse_llm_text(wire_api=wire_api, content_type=content_type, raw_text=raw_text)
         parsed = _safe_json_loads(content) if isinstance(content, str) else None
+        response_json = parsed if isinstance(parsed, dict) else None
+        evaluation_v2_shadow = build_evaluation_v2_shadow(
+            results=results,
+            response_json=response_json,
+            foundation_enabled=cfg.foundation_enabled,
+            foundation_weights=cfg.foundation_weights,
+            profile_active=cfg.profile_active,
+            profile_active_profiles=cfg.profile_active_profiles,
+            profile_enabled=cfg.profile_enabled,
+            profile_enabled_by_name=cfg.profile_enabled_by_name,
+            profile_weight=cfg.profile_weight,
+            profile_weights=cfg.profile_weights,
+            profile_weights_by_name=cfg.profile_weights_by_name,
+            profile_merge_weights=cfg.profile_merge_weights,
+            profile_router_context=cfg.profile_router_context,
+            profile_fallback_to_foundation_only=cfg.profile_fallback_to_foundation_only,
+            threshold_0_100=cfg.shadow_pass_threshold_0_100,
+        )
         return {
             "enabled": True,
             "skipped": False,
@@ -431,8 +489,9 @@ def evaluate_with_llm(
             "model": cfg.model,
             "base_url": cfg.base_url,
             "wire_api": wire_api,
-            "response_json": parsed if isinstance(parsed, dict) else None,
+            "response_json": response_json,
             "response_text": content if isinstance(content, str) else "",
+            "evaluation_v2_shadow": evaluation_v2_shadow,
             "raw_response_preview": raw_text[:1000],
         }
     except Exception as exc:
@@ -445,7 +504,13 @@ def evaluate_with_llm(
         }
 
 
-def write_evaluation_md(path: Path, rule_eval: dict[str, Any] | None, llm_eval: dict[str, Any]) -> None:
+def write_evaluation_md(
+    path: Path,
+    rule_eval: dict[str, Any] | None,
+    llm_eval: dict[str, Any],
+    evaluation_primary: dict[str, Any] | None = None,
+    evaluation_compare: dict[str, Any] | None = None,
+) -> None:
     lines: list[str] = ["# 对话评估报告", ""]
     if isinstance(rule_eval, dict) and rule_eval:
         lines.extend(
@@ -492,5 +557,96 @@ def write_evaluation_md(path: Path, rule_eval: dict[str, Any] | None, llm_eval: 
             lines.append(f"- summary: `{response_json.get('summary')}`")
         else:
             lines.append("- response_json: `(not valid JSON)`")
+
+    lines.extend(["", "## Primary Decision", ""])
+    if isinstance(evaluation_primary, dict):
+        lines.extend(
+            [
+                f"- mode: `{evaluation_primary.get('mode', '')}`",
+                f"- source: `{evaluation_primary.get('source', '')}`",
+                f"- pass: `{evaluation_primary.get('pass', False)}`",
+                f"- score_0_100: `{evaluation_primary.get('score_0_100')}`",
+                f"- threshold_0_100: `{evaluation_primary.get('threshold_0_100')}`",
+            ]
+        )
+    else:
+        lines.append("- primary: `(not provided)`")
+
+    lines.extend(["", "## Mode Comparison (A/B)", ""])
+    if isinstance(evaluation_compare, dict):
+        lines.append(f"- primary_mode: `{evaluation_compare.get('primary_mode', '')}`")
+        for mode in ("llm_v1", "foundation_v2", "final_v2"):
+            row = evaluation_compare.get(mode)
+            if not isinstance(row, dict):
+                lines.append(f"- {mode}: `(unavailable)`")
+                continue
+            lines.append(
+                f"- {mode}: available=`{row.get('available')}` pass=`{row.get('pass')}` "
+                f"score_0_100=`{row.get('score_0_100')}` threshold_0_100=`{row.get('threshold_0_100')}`"
+            )
+        delta = evaluation_compare.get("delta")
+        if isinstance(delta, dict):
+            lines.append(f"- delta.foundation_minus_llm_v1: `{delta.get('foundation_minus_llm_v1')}`")
+            lines.append(f"- delta.final_minus_foundation: `{delta.get('final_minus_foundation')}`")
+            lines.append(f"- delta.final_minus_llm_v1: `{delta.get('final_minus_llm_v1')}`")
+    else:
+        lines.append("- compare: `(not provided)`")
+
+    shadow = llm_eval.get("evaluation_v2_shadow")
+    lines.extend(["", "## Evaluation V2 (Shadow)", ""])
+    if not isinstance(shadow, dict):
+        lines.append("- shadow: `(unavailable)`")
+    else:
+        final = shadow.get("final")
+        if not isinstance(final, dict):
+            final = {}
+        foundation = shadow.get("foundation")
+        if not isinstance(foundation, dict):
+            foundation = {}
+        profile = shadow.get("profile")
+        if not isinstance(profile, dict):
+            profile = {}
+        lines.extend(
+            [
+                f"- mode: `{shadow.get('mode', '')}`",
+                f"- final_score_0_100: `{final.get('score_0_100', 0)}`",
+                f"- final_pass: `{final.get('pass', False)}`",
+                f"- threshold_0_100: `{final.get('threshold_0_100', 0)}`",
+                f"- merge_mode: `{final.get('merge_mode', '')}`",
+                "",
+                f"- foundation_enabled: `{foundation.get('enabled', False)}`",
+                f"- foundation_score: `{foundation.get('score', 0)}`",
+                f"- foundation_weights: `{foundation.get('weights', {})}`",
+                f"- foundation_dimensions: `{foundation.get('dimensions', {})}`",
+                "",
+                f"- profile_name: `{profile.get('name', '')}`",
+                f"- profile_enabled: `{profile.get('enabled', False)}`",
+                f"- profile_score: `{profile.get('score', 0)}`",
+                f"- profile_weight: `{profile.get('weight', 0)}`",
+                f"- profile_weights: `{profile.get('weights', {})}`",
+                f"- profile_dimensions: `{profile.get('dimensions', {})}`",
+            ]
+        )
+        router = shadow.get("profile_router")
+        if isinstance(router, dict):
+            lines.extend(
+                [
+                    "",
+                    f"- profile_router_source: `{router.get('source', '')}`",
+                    f"- profile_router_capability_mode: `{router.get('capability_mode', '')}`",
+                    f"- profile_router_selected: `{router.get('selected_profiles', [])}`",
+                ]
+            )
+        combined = shadow.get("profile_combined")
+        if isinstance(combined, dict):
+            lines.extend(
+                [
+                    "",
+                    f"- profile_combined_enabled: `{combined.get('enabled', False)}`",
+                    f"- profile_combined_score: `{combined.get('score', 0)}`",
+                    f"- profile_combined_selected: `{combined.get('selected_profiles', [])}`",
+                    f"- profile_combined_merge_weights: `{combined.get('merge_weights', {})}`",
+                ]
+            )
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")

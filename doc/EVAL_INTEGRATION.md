@@ -18,6 +18,8 @@
 
 - `evaluation.md` 便于人工快速查看
 - `evaluation.json` 便于程序统计与趋势分析
+- `evaluation.json.evaluation_v2_shadow`（若存在）用于并行观察“通用底盘 + profile”评分，不影响旧结论字段
+- `evaluation.json.evaluation_primary` 为当前主判定（可配置来源）
 
 探针评估（开启时）支持两类评分：
 
@@ -43,6 +45,10 @@
 - `llm_eval.model=...`
 - `llm_eval.api_key=...`
 - `llm_eval.timeout_sec=...`
+- `llm_eval.primary_mode=foundation_v2`（推荐）
+- `llm_eval.foundation.*`（影子模式：通用底盘维度与权重）
+- `llm_eval.profile.*`（影子模式：profile 激活与融合权重）
+- `llm_eval.profiles.memory_compression.*`（影子模式：记忆/压缩 profile 维度权重）
 
 ---
 
@@ -99,3 +105,25 @@
 - 压缩前后 token 大小
 - 摘要版本或摘要 ID
 - 保留/丢弃事实标识
+
+---
+
+## Phase C Update (A/B Compare)
+
+- `run_data/evaluation.json` now includes `evaluation_compare`.
+- `evaluation_compare.llm_v1`: legacy score/pass from `llm_evaluation.response_json`.
+- `evaluation_compare.foundation_v2`: base-foundation score/pass from `evaluation_v2_shadow.foundation`.
+- `evaluation_compare.final_v2`: merged score/pass from `evaluation_v2_shadow.final`.
+- `evaluation_compare.delta`: score deltas for `foundation_minus_llm_v1`, `final_minus_foundation`, `final_minus_llm_v1`.
+- `evaluation.md` now includes `## Mode Comparison (A/B)` for quick human comparison.
+- Backward compatibility remains unchanged: legacy fields and `evaluation_primary` are still preserved.
+
+## Phase D Update (Multi-Profile + Routing)
+
+- Added config-driven profile routing by capability mode.
+- Added multi-profile score composition within `evaluation_v2_shadow`.
+- Added new observability nodes:
+  - `profile_router`
+  - `profile_combined`
+  - `profiles.details`
+- Compatibility note: `profile` legacy summary is still kept for old consumers.
