@@ -83,7 +83,7 @@ class ProbeEvalConfig:
     llm_weight: float
 
 
-REQUIRED_NOTEBOOK_CLEAR_TEXT = "璇蜂綘鎶婂綋鍓嶈蹇嗘枃浠堕噸缃负绯荤粺鍒濆妯℃澘"
+REQUIRED_NOTEBOOK_CLEAR_TEXT = "请你把当前记忆文件重置为系统初始模板"
 DEFAULT_FIRST_USER_TEXT = REQUIRED_NOTEBOOK_CLEAR_TEXT
 PROMPTS_DIR = AUTO_TEST_DIR / "prompts"
 FRAMEWORK_PROMPTS_DIR = PROMPTS_DIR / "framework"

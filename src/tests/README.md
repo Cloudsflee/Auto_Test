@@ -1,39 +1,84 @@
 # tests 目录说明
 
-- 本目录存放可执行的 auto-test 测试流程。
-- 主要职责：组装请求、执行多轮会话、解析 SSE 事件并写出结果。
-- 统一约定：首轮固定为 `请你把当前记忆文件重置为系统初始模板`。
-- `user_simulator` 支持动态角色扮演用户输入（默认模式 `provider_context`）。
-- 默认工具集保留记忆/压缩相关工具和 `option_card`。
-- `post_submit` 与 `ui_cmd` 在当前测试范围内默认关闭。
-- 交互回调默认启用“模拟回传”。
-- 可通过 `AUTO_TEST_SIMULATE_INTERACT_CALLBACK=false` 关闭模拟回传。
-- 安全保护：`AUTO_TEST_MAX_SIM_CALLBACK_ROUNDS`（默认 `8`）。
-- 轮次可由 `user_simulator.max_turns`、`AUTO_TEST_MAX_TURNS` 或命令行 `--max-turns` 控制。
-- 能力考核模式可由 `user_simulator.capability_mode`（或环境变量 `AUTO_TEST_USER_SIM_CAPABILITY_MODE`）配置：
-  - `alternating` / `mixed` / `single_random` / `copy_only` / `image_only`
-- 工作区图片/二进制导出采用链式回退：
-  - 先走 `files/session` API
-  - 失败后走 DotAI FS（`/dotai/fs/stat` + `/dotai/fs/download`）
-- DotAI 地址可通过 `config.dotai_base_url` 或环境变量 `AUTO_TEST_DOTAI_BASE_URL` 指定。
-- 提示词目录已重构为两层：
-  - `prompts/framework/`：通用机制与格式约束
-  - `prompts/targets/<target_name>/`：目标智能体专属场景/画像/rubric
-- 探针评估（Phase 1 + Phase 2）可通过环境变量开启：
-  - `AUTO_TEST_ENABLE_PROBE_EVAL=true`
-  - 可选：`AUTO_TEST_PROBE_DATASET_PATH=datasets/probes/clinic_memory_v1.json`
-  - 可选：`AUTO_TEST_ENABLE_PROBE_LLM_JUDGE=true`
-  - 可选：`AUTO_TEST_PROBE_LLM_URL` / `AUTO_TEST_PROBE_LLM_MODEL` / `AUTO_TEST_PROBE_LLM_API_KEY`
-  - 输出：`run_data/probe_results.json` 与 `probe_evaluation.md`
+本目录存放 `auto_test` 的可执行测试入口与测试编排代码。
 
-当前主入口文件：
-- `run_5turn_session_test.py`：多轮会话测试基线入口。
+## 主要脚本
 
-模块拆分（提升可维护性）：
-- `user_simulator_engine.py`：能力模式策略 + 角色生成 + 用户发言生成
-- `workspace_pipeline.py`：workspace 快照识别 + workspace 导出 + files API / DotAI FS 下载回退
+- `run_5turn_session_test.py`
+  - 通用多轮会话自动测试入口（create_session -> execute_session -> SSE 解析 -> 结果落盘）。
+  - 支持用户模拟器、整体评估（LLM）、探针评估、workspace 导出。
 
-- 如需启用高级交互工具：
-  - `AUTO_TEST_ENABLE_INTERACT_TOOLS=true`（同时开启 `post_submit` 与 `ui_cmd`）
-  - 或细粒度开关：`AUTO_TEST_ENABLE_POST_SUBMIT_TOOL=true`、`AUTO_TEST_ENABLE_UI_CMD_TOOL=true`
-- 可通过 `AUTO_TEST_DISABLE_INTERACT_TOOLS=true` 关闭全部交互工具注册。
+- `run_memory_compression_failure_scan.py`
+  - 记忆压缩失效轮次扫描脚本。
+  - 关键行为：
+    - 每个 session 第1轮固定重置模板，第2轮埋入“编号探针”。
+    - 非探针轮次优先使用 `user_simulator_engine`（角色 LLM）生成用户输入。
+    - 默认持续对话，直到首次探针失效（即被遗忘）才结束该 session。
+    - 前 `warmup_sessions`（默认2）用于粗定位，后续围绕估计失效轮次聚焦测试。
+    - 支持并行 session（warmup 阶段仍顺序执行）。
+  - 可选安全开关：
+    - `--hard-max-turns`：每个 session 的硬上限（默认 `0`，表示不设上限）。
+
+- `run_memory_failure_campaign.py`
+  - 按“3并发 seed -> 估计失效轮 -> 3轮x3并发 focused”执行完整 campaign。
+  - 结果统一放在一个 `memory_failure/<campaign_id>/` 下，便于整体溯源。
+
+## 运行示例
+
+```powershell
+# 通用会话测试（test 环境，10轮）
+python auto_test/src/tests/run_5turn_session_test.py --env test --max-turns 10
+
+# 记忆压缩失效扫描（test 环境，10 个 session，默认跑到失效）
+python auto_test/src/tests/run_memory_compression_failure_scan.py --env test --sessions 10
+
+# 记忆压缩失效扫描（并行 + 安全上限）
+python auto_test/src/tests/run_memory_compression_failure_scan.py --env test --sessions 10 --parallel-sessions 3 --hard-max-turns 80
+
+# campaign：先3并发seed，再3轮x3并发focused
+python auto_test/src/tests/run_memory_failure_campaign.py --env test --parallel-sessions 3
+```
+
+## 结果目录（失效扫描）
+
+```text
+auto_test/results/memory_failure/<run_id>/
+  run_manifest.json
+  sessions/
+    session_01/
+      raw_events.jsonl
+      session_meta.json
+      run_data/
+        turn_results.json
+        probe_checks.json
+      workspace/
+        _manifest.json
+        ...
+    session_02/
+    ...
+  aggregate/
+    summary.json
+    summary.md
+    failure_turn_distribution.svg
+```
+
+```text
+auto_test/results/memory_failure/<campaign_id>/
+  seed_3sessions/
+    sessions/...
+    aggregate/summary.json
+  focused_round_1/
+    sessions/...
+    aggregate/summary.json
+  focused_round_2/
+    sessions/...
+    aggregate/summary.json
+  focused_round_3/
+    sessions/...
+    aggregate/summary.json
+  aggregate/
+    campaign_summary.json
+    campaign_summary.md
+    focused_combined_distribution.svg
+  run_manifest.json
+```
