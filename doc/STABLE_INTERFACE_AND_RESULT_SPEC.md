@@ -231,3 +231,23 @@ auto_test/results/session_<scenario>_<run_id>/
 4. results 产物结构变化
 
 其余测试策略、脚本命名、运行入口、目录说明等，请在 `auto_test/README.md` 维护。
+
+---
+
+## 10. RUN_END 缺失容错（2026-04）
+
+为适配后端在 memory compaction 阶段偶发 `RUN_END` 丢失的情况，`auto_test` 增加了“结束推断”机制（仅在无 pending 交互工具回调时生效）：
+
+1. 若观测到 `TOOL_CALL_START` 且工具名为 `memory_file_compaction` 或 `summary_compaction`
+2. 且后续出现“压缩完成”文本（如“记忆文件压缩完成”“会话记忆压缩完成”）
+3. 即使未收到 `RUN_END`，也可推断本轮结束
+
+推断结果会写入 `turn_results.json`：
+
+- `run_end_inferred`：是否触发推断
+- `run_end_infer_reason`：推断原因（如 `inferred_after_compaction_done_text_on_timeout`）
+
+说明：
+
+- 该机制是兼容分支，不改变 `RUN_END` 作为主完成信号的优先级。
+- 对含 `option_card/post_submit/ui_cmd` 的 pending 回调轮次，不启用该推断，避免误判。

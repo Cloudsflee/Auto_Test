@@ -1,8 +1,8 @@
 {
   "_comment": "auto_test 主配置文件（JSON）。本文件采用“注释字段”方式说明含义，运行时会忽略未知字段。",
   "_comment_usage": "建议先复制为 config.local.json 再填真实账号信息。所有 *_api_key / token 请勿提交到公共仓库。",
-  "_comment_env": "多环境配置说明：默认使用 prod，可通过 --env test 或 AUTO_TEST_ENV=test 切换。",
-  "active_env": "prod",
+  "_comment_env": "多环境配置说明：默认使用 test，可通过 --env prod 或 AUTO_TEST_ENV=prod 切换。",
+  "active_env": "test",
   "environments": {
     "_comment": "仅放需要按环境切换的字段（base_url / dotai_base_url / auth）。",
     "prod": {
@@ -123,7 +123,7 @@
       "target_name": "目标助手名称，对应 prompts/targets/<target_name>。",
       "max_turns": "模拟轮数上限。",
       "capability_mode": "能力考核模式（会影响 profile 路由）。",
-      "first_user_message": "首轮固定句；当前约定为“请你把当前记忆文件重置为系统初始模板”。"
+      "first_user_message": "首轮用户开场语（不再尝试清空共享记忆文件）。"
     },
     "enabled": true,
     "mode": "provider_context",
@@ -136,7 +136,7 @@
     "capability_mode": "alternating",
     "user_temperature": 0.9,
     "role_temperature": 1.0,
-    "first_user_message": "请你把当前记忆文件重置为系统初始模板",
+    "first_user_message": "我这边有个需求，先给我一个初版方向，我再告诉你怎么调整。",
     "system_prompt_file": "framework/simulator/system/user_simulator_system.prompt",
     "role_system_prompt_file": "framework/simulator/role_generation/role_system.prompt",
     "role_user_prompt_file": "framework/simulator/role_generation/role_user.prompt"

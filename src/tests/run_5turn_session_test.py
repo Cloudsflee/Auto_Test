@@ -1,14 +1,17 @@
 ﻿from __future__ import annotations
 
 import argparse
+import base64
 import json
 import os
+import random
 import re
+import subprocess
 import sys
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse, urlunparse
@@ -83,8 +86,10 @@ class ProbeEvalConfig:
     llm_weight: float
 
 
-REQUIRED_NOTEBOOK_CLEAR_TEXT = "请你把当前记忆文件重置为系统初始模板"
-DEFAULT_FIRST_USER_TEXT = REQUIRED_NOTEBOOK_CLEAR_TEXT
+DEFAULT_FIRST_USER_TEXT = "我这边有个需求，先给我一个初版方向，我再告诉你怎么调整。"
+# Backward-compatible placeholder key retained for existing prompt templates.
+# It now maps to first-turn opener text (not reset-memory instruction).
+REQUIRED_NOTEBOOK_CLEAR_TEXT = DEFAULT_FIRST_USER_TEXT
 PROMPTS_DIR = AUTO_TEST_DIR / "prompts"
 FRAMEWORK_PROMPTS_DIR = PROMPTS_DIR / "framework"
 TARGET_PROMPTS_DIR = PROMPTS_DIR / "targets"
@@ -97,6 +102,16 @@ DEFAULT_PROBE_JUDGE_SYSTEM_PROMPT_FILE = FRAMEWORK_PROMPTS_DIR / "evaluator" / "
 DEFAULT_PROBE_JUDGE_USER_PROMPT_FILE = FRAMEWORK_PROMPTS_DIR / "evaluator" / "probe" / "probe_judge_user.prompt"
 INTERACT_TOOL_NAMES = {"option_card", "post_submit", "ui_cmd"}
 DEFAULT_SIM_CALLBACK_MAX_ROUNDS = 8
+COMPACTION_TOOL_NAMES = {"memory_file_compaction", "summary_compaction"}
+TRANSIENT_HTTP_STATUS_CODES = {429, 502, 503, 504}
+TERMINAL_EVENT_TYPES = {"RUN_END", "RUN_ERROR"}
+TEST_ENTRY_SCRIPT_MARKERS = (
+    "/auto_test/src/tests/run_5turn_session_test.py",
+    "/auto_test/src/tests/run_memory_compression_failure_scan.py",
+    "/auto_test/src/tests/run_memory_failure_campaign.py",
+    "/auto_test/src/tests/postprocess_memory_failure_cn_report.py",
+)
+TEST_PROCESS_NAME_HINTS = ("python", "powershell", "pwsh", "cmd")
 
 
 def _pick_text_value(text: str, key: str) -> str:
@@ -206,6 +221,91 @@ def _env_bool(key: str, default: bool) -> bool:
     return default
 
 
+def _coerce_int(value: Any) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    try:
+        return int(float(text))
+    except Exception:
+        return 0
+
+
+def _decode_b64url_json(payload_b64: str) -> dict[str, Any]:
+    raw = str(payload_b64 or "").strip()
+    if not raw:
+        return {}
+    padding = "=" * ((4 - len(raw) % 4) % 4)
+    try:
+        decoded = base64.urlsafe_b64decode((raw + padding).encode("utf-8"))
+    except Exception:
+        return {}
+    obj = _safe_json_loads(decoded.decode("utf-8", errors="ignore"))
+    return obj if isinstance(obj, dict) else {}
+
+
+def _extract_jwt_payload(token: str) -> dict[str, Any]:
+    raw = str(token or "").strip()
+    if raw.lower().startswith("bearer "):
+        raw = raw.split(" ", 1)[1].strip()
+    parts = raw.split(".")
+    if len(parts) != 3:
+        return {}
+    return _decode_b64url_json(parts[1])
+
+
+def _extract_token_exp_sec(payload: dict[str, Any]) -> int:
+    if not isinstance(payload, dict):
+        return 0
+    for key in ("exp", "expireTime", "expire_time", "expires_at"):
+        if key not in payload:
+            continue
+        value = _coerce_int(payload.get(key))
+        if value <= 0:
+            continue
+        if value > 10**12:
+            return int(value / 1000)
+        return value
+    return 0
+
+
+def build_auth_context(token: str, uid: str, email: str) -> dict[str, Any]:
+    payload = _extract_jwt_payload(token)
+    token_uid = str(payload.get("uid") or payload.get("sub") or "").strip()
+    token_email = str(payload.get("mail") or payload.get("email") or "").strip()
+    exp_sec = _extract_token_exp_sec(payload)
+    now_sec = int(time.time())
+    exp_utc = datetime.fromtimestamp(exp_sec, timezone.utc).isoformat(timespec="seconds") if exp_sec > 0 else ""
+    return {
+        "token_uid": token_uid,
+        "token_email": token_email,
+        "token_exp_sec": exp_sec,
+        "token_exp_utc": exp_utc,
+        "token_expired": bool(exp_sec > 0 and exp_sec <= now_sec),
+        "uid_match": bool(uid and token_uid and uid == token_uid),
+        "email_match": bool(email and token_email and email.strip().lower() == token_email.lower()),
+    }
+
+
+def _should_retry_transient_http_status(status_code: int) -> bool:
+    return status_code in TRANSIENT_HTTP_STATUS_CODES
+
+
+def _sleep_with_retry_backoff(attempt_idx: int) -> None:
+    # attempt_idx starts from 1.
+    base_sec = max(0.2, min(5.0, _env_float("AUTO_TEST_RETRY_BASE_SEC", 0.8)))
+    cap_sec = max(base_sec, min(30.0, _env_float("AUTO_TEST_RETRY_CAP_SEC", 6.0)))
+    delay = min(cap_sec, base_sec * (2 ** max(0, attempt_idx - 1)))
+    jitter = random.uniform(0.0, min(0.5, delay * 0.25))
+    time.sleep(max(0.01, delay + jitter))
+
+
 def _cfg_bool(value: Any, default: bool) -> bool:
     if isinstance(value, bool):
         return value
@@ -266,9 +366,171 @@ def parse_runtime_args(argv: list[str]) -> argparse.Namespace:
         "--env",
         type=str,
         default="",
-        help="Target runtime environment (prod/test). Default is prod.",
+        help="Target runtime environment (prod/test). Default is test.",
+    )
+    parser.add_argument(
+        "--skip-preflight-cleanup",
+        action="store_true",
+        help="Skip pre-run cleanup for stale auto_test test processes.",
     )
     return parser.parse_args(argv)
+
+
+def _normalize_cmdline_for_match(text: Any) -> str:
+    return str(text or "").strip().lower().replace("\\", "/")
+
+
+def _list_windows_processes_for_cleanup() -> list[dict[str, Any]]:
+    ps_cmd = (
+        "Get-CimInstance Win32_Process | "
+        "Select-Object ProcessId,ParentProcessId,Name,CommandLine | "
+        "ConvertTo-Json -Depth 3"
+    )
+    try:
+        cp = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="ignore",
+            timeout=25,
+        )
+    except Exception:
+        return []
+    if cp.returncode != 0:
+        return []
+    payload = _safe_json_loads((cp.stdout or "").strip())
+    if isinstance(payload, dict):
+        payload = [payload]
+    if not isinstance(payload, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for row in payload:
+        if isinstance(row, dict):
+            rows.append(row)
+    return rows
+
+
+def _collect_parent_chain(pid_to_parent: dict[int, int], start_pid: int) -> set[int]:
+    chain: set[int] = set()
+    cursor = int(start_pid)
+    for _ in range(64):
+        if cursor <= 0 or cursor in chain:
+            break
+        chain.add(cursor)
+        cursor = int(pid_to_parent.get(cursor, 0))
+    return chain
+
+
+def preflight_cleanup_test_processes(caller: str) -> dict[str, Any]:
+    if os.name != "nt":
+        print(f"[INFO] preflight_cleanup skipped: unsupported_os={os.name}")
+        return {
+            "caller": caller,
+            "supported": False,
+            "candidates": 0,
+            "killed": 0,
+            "failed": [],
+        }
+
+    rows = _list_windows_processes_for_cleanup()
+    if not rows:
+        print("[WARN] preflight_cleanup skipped: cannot enumerate processes")
+        return {
+            "caller": caller,
+            "supported": True,
+            "candidates": 0,
+            "killed": 0,
+            "failed": [],
+        }
+
+    pid_to_parent: dict[int, int] = {}
+    for row in rows:
+        pid = _coerce_int(row.get("ProcessId"))
+        if pid <= 0:
+            continue
+        pid_to_parent[pid] = _coerce_int(row.get("ParentProcessId"))
+
+    protect_pids = _collect_parent_chain(pid_to_parent, os.getpid())
+    protect_pids.add(os.getppid())
+
+    candidates: dict[int, dict[str, str]] = {}
+    for row in rows:
+        pid = _coerce_int(row.get("ProcessId"))
+        if pid <= 0 or pid in protect_pids:
+            continue
+        proc_name = str(row.get("Name") or "").strip()
+        proc_name_norm = proc_name.lower()
+        if not any(hint in proc_name_norm for hint in TEST_PROCESS_NAME_HINTS):
+            continue
+        cmdline = str(row.get("CommandLine") or "")
+        cmd_norm = _normalize_cmdline_for_match(cmdline)
+        if not cmd_norm:
+            continue
+
+        has_known_entry = any(marker in cmd_norm for marker in TEST_ENTRY_SCRIPT_MARKERS)
+        is_auto_test_runner = "/auto_test/src/tests/" in cmd_norm and ("run_" in cmd_norm or "pytest" in cmd_norm)
+        if not (has_known_entry or is_auto_test_runner):
+            continue
+
+        candidates[pid] = {
+            "name": proc_name,
+            "cmdline": cmdline.strip(),
+        }
+
+    killed = 0
+    failed: list[dict[str, Any]] = []
+    for pid, meta in sorted(candidates.items(), key=lambda item: item[0]):
+        try:
+            cp = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                check=False,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="ignore",
+                timeout=20,
+            )
+        except Exception as exc:
+            failed.append(
+                {
+                    "pid": pid,
+                    "name": meta.get("name") or "",
+                    "error": str(exc),
+                }
+            )
+            continue
+
+        if cp.returncode == 0:
+            killed += 1
+            print(f"[INFO] preflight_cleanup killed pid={pid} name={meta.get('name')}")
+        else:
+            failed.append(
+                {
+                    "pid": pid,
+                    "name": meta.get("name") or "",
+                    "stderr": (cp.stderr or "").strip(),
+                    "stdout": (cp.stdout or "").strip(),
+                }
+            )
+
+    print(
+        "[INFO] preflight_cleanup "
+        f"caller={caller} candidates={len(candidates)} killed={killed} failed={len(failed)}"
+    )
+    for item in failed[:5]:
+        print(
+            "[WARN] preflight_cleanup_failed "
+            f"pid={item.get('pid')} name={item.get('name')} reason={(item.get('stderr') or item.get('error') or item.get('stdout') or '(unknown)')}"
+        )
+    return {
+        "caller": caller,
+        "supported": True,
+        "candidates": len(candidates),
+        "killed": killed,
+        "failed": failed,
+    }
 
 
 def resolve_config_path() -> Path:
@@ -278,13 +540,20 @@ def resolve_config_path() -> Path:
     return CFG_PATH_CANDIDATES[0]
 
 
-def _normalize_env_name(raw: Any, default: str = "prod") -> str:
+def _normalize_env_name(raw: Any, default: str = "test") -> str:
     text = str(raw or "").strip().lower()
     if text in {"prod", "production"}:
         return "prod"
     if text in {"test", "testing", "staging", "stage"}:
         return "test"
     return default
+
+
+def _looks_like_compaction_done_text(text: Any) -> bool:
+    raw = str(text or "").strip()
+    if not raw:
+        return False
+    return ("压缩完成" in raw) or ("壓縮完成" in raw)
 
 
 def _merge_dict(primary: Any, fallback: Any) -> dict[str, Any]:
@@ -298,14 +567,14 @@ def _merge_dict(primary: Any, fallback: Any) -> dict[str, Any]:
 
 def _resolve_active_env_name(obj: dict[str, Any], runtime_env: str) -> str:
     if runtime_env:
-        return _normalize_env_name(runtime_env, "prod")
+        return _normalize_env_name(runtime_env, "test")
     env_from_var = str(os.getenv("AUTO_TEST_ENV", "")).strip()
     if env_from_var:
-        return _normalize_env_name(env_from_var, "prod")
+        return _normalize_env_name(env_from_var, "test")
     env_from_cfg = str(obj.get("active_env") or "").strip()
     if env_from_cfg:
-        return _normalize_env_name(env_from_cfg, "prod")
-    return "prod"
+        return _normalize_env_name(env_from_cfg, "test")
+    return "test"
 
 
 def _load_json_config(path: Path, runtime_env: str) -> AuthConfig:
@@ -383,7 +652,7 @@ def _load_json_config(path: Path, runtime_env: str) -> AuthConfig:
 
 def _load_text_config(path: Path, runtime_env: str) -> AuthConfig:
     text = path.read_text(encoding="utf-8", errors="ignore")
-    active_env = _normalize_env_name(runtime_env or os.getenv("AUTO_TEST_ENV", "") or "prod", "prod")
+    active_env = _normalize_env_name(runtime_env or os.getenv("AUTO_TEST_ENV", "") or "test", "test")
     base_url = _pick_text_value(text, "base_url").rstrip("/")
     dotai_base_url = _pick_text_value(text, "dotai_base_url").rstrip("/")
     proxy_http = _pick_text_value(text, "http_proxy")
@@ -856,14 +1125,11 @@ def _build_evaluation_compare(
     }
 
 
-def _ensure_required_note_clear_text(text: str) -> str:
+def _normalize_first_user_message(text: str) -> str:
     normalized = (text or "").strip()
     if not normalized:
         return DEFAULT_FIRST_USER_TEXT
-    if normalized.startswith(REQUIRED_NOTEBOOK_CLEAR_TEXT):
-        return normalized
-    # Keep the first sentence strictly fixed, append custom text on the next line.
-    return f"{REQUIRED_NOTEBOOK_CLEAR_TEXT}\n{normalized}"
+    return normalized
 
 
 def build_user_simulator_config(cfg: AuthConfig, llm_eval_cfg: LLMEvalConfig) -> UserSimulatorConfig:
@@ -922,31 +1188,31 @@ def build_user_simulator_config(cfg: AuthConfig, llm_eval_cfg: LLMEvalConfig) ->
             ),
         ),
     )
-    first_user_message = _ensure_required_note_clear_text(
+    first_user_message = _normalize_first_user_message(
         str(sim_cfg.get("first_user_message") or "").strip() or DEFAULT_FIRST_USER_TEXT
     )
 
     default_system_prompt = (
-        "You are the user simulator in an automated test. "
-        "Generate the next user input based on the role and conversation history. "
-        "Return JSON only with fields: user_text, stop, reason. "
-        "user_text must be natural language and must not include explanations."
+        "你是自动化测试中的用户模拟器。"
+        "请基于角色信息和对话历史生成下一条用户输入。"
+        "仅输出 JSON，字段为 user_text / stop / reason。"
+        "user_text 必须是自然语言，不要包含解释文本。"
     )
     default_scenario_prompt = (
-        "You are role-playing a realistic customer for the target assistant.\n"
-        "Target name: {{TARGET_NAME}}\n\n"
-        "Target policies:\n"
+        "你正在扮演目标助手的真实用户。\n"
+        "target 名称：{{TARGET_NAME}}\n\n"
+        "target 能力边界与规则：\n"
         "{{TARGET_POLICIES}}\n\n"
-        "Target intent pool:\n"
+        "target 意图池：\n"
         "{{TARGET_INTENT_POOL}}\n\n"
-        "Probe rubrics (optional):\n"
+        "探针评分细则（可选）：\n"
         "{{TARGET_RUBRICS}}\n\n"
-        "Randomization constraints:\n"
-        "1. Pick one main intent each turn; avoid fixed ordering.\n"
-        "2. Each turn should request a concrete deliverable or a clear follow-up.\n"
-        "3. Vary tone and length naturally.\n"
-        "4. Avoid repeating the previous user sentence pattern.\n\n"
-        "Turn limit: {{MAX_TURNS}}. Set stop=true only when the goal is complete."
+        "对话推进约束：\n"
+        "1. 每轮聚焦一个主意图，避免固定顺序。\n"
+        "2. 每轮提出明确诉求：可交付内容或可执行下一步。\n"
+        "3. 语气和长度自然变化，避免重复句式。\n"
+        "4. 先给粗目标，后续逐轮细化。\n\n"
+        "轮次上限：{{MAX_TURNS}}。仅当目标完成时才可 stop=true。"
     )
     default_role_system_prompt = (
         "You are a test-data designer that generates a role-playable random customer persona. "
@@ -959,7 +1225,6 @@ def build_user_simulator_config(cfg: AuthConfig, llm_eval_cfg: LLMEvalConfig) ->
         "鍙€夌敤鎴风敾鍍忔牱鏈紙鍙€熼壌浣嗙姝㈢収鎶勶級锛歕n{{TARGET_PERSONAS}}\n\n"
         "绾︽潫淇℃伅锛歕n"
         "- 鏈疆鏈€澶у璇濇暟锛歿{MAX_TURNS}}\n"
-        "- 棣栬疆鍥哄畾鐢ㄦ埛鍔ㄤ綔锛歿{REQUIRED_NOTEBOOK_CLEAR_TEXT}}\n\n"
         "瑕佹眰锛歕n"
         "1. 瑙掕壊瑕佹湁鐪熷疄涓氬姟鑳屾櫙涓庢矡閫氶鏍笺€俓n"
         "2. 蹇呴』鍖呭惈鍐茬獊绾︽潫锛堜緥濡傞绠椼€佹椂鏁堛€佸悎瑙勩€佽皟鎬у啿绐侊級銆俓n"
@@ -967,7 +1232,7 @@ def build_user_simulator_config(cfg: AuthConfig, llm_eval_cfg: LLMEvalConfig) ->
         "杈撳嚭 JSON 瀛楁锛歕n"
         "- role_name\n"
         "- identity\n"
-        "- business_background\n"
+        "- domain_context\n"
         "- communication_style\n"
         "- current_goal\n"
         "- constraints\n"
@@ -1001,7 +1266,10 @@ def build_user_simulator_config(cfg: AuthConfig, llm_eval_cfg: LLMEvalConfig) ->
         "INDUSTRY_OPTIONS": industry_options,
         "IDENTITY_OPTIONS": identity_options,
         "MAX_TURNS": str(max_turns),
-        "REQUIRED_NOTEBOOK_CLEAR_TEXT": REQUIRED_NOTEBOOK_CLEAR_TEXT,
+        # Keep legacy placeholder key for compatibility with existing templates.
+        # Deprecated: role-generation prompts should not bind first-turn execution text.
+        "REQUIRED_NOTEBOOK_CLEAR_TEXT": "",
+        "FIRST_USER_MESSAGE": first_user_message,
     }
     scenario_template = str(sim_cfg.get("scenario_prompt") or "").strip()
     if not scenario_template:
@@ -1108,19 +1376,324 @@ def create_session(
     }
     if settings_json:
         body["settings"] = settings_json
-    resp = requests.post(url, headers=headers, json=body, timeout=30)
-    trace = trace_info_from_response(resp)
-    resp.raise_for_status()
+    connect_timeout_sec = max(3, min(60, _env_int("AUTO_TEST_HTTP_CONNECT_TIMEOUT_SEC", 15)))
+    read_timeout_sec = max(
+        connect_timeout_sec + 1,
+        min(120, _env_int("AUTO_TEST_CREATE_SESSION_READ_TIMEOUT_SEC", 30)),
+    )
+    max_retries = max(0, min(3, _env_int("AUTO_TEST_CREATE_SESSION_RETRIES", 2)))
+    last_error: Exception | None = None
 
-    payload = resp.json()
-    code = payload.get("code")
-    if code not in (0, 200):
-        raise RuntimeError(f"create_session 涓氬姟閿欒: {payload}")
+    for attempt in range(0, max_retries + 1):
+        resp = None
+        try:
+            resp = requests.post(
+                url,
+                headers=headers,
+                json=body,
+                timeout=(connect_timeout_sec, read_timeout_sec),
+            )
+            trace = trace_info_from_response(resp)
+            status_code = int(resp.status_code or 0)
+            if status_code == 401:
+                raise RuntimeError(
+                    "create_session unauthorized(401); check token/uid/email alignment and token expiry."
+                )
+            if _should_retry_transient_http_status(status_code) and attempt < max_retries:
+                _sleep_with_retry_backoff(attempt + 1)
+                continue
+            resp.raise_for_status()
 
-    session_id = ((payload.get("data") or {}).get("sessionId") or "").strip()
+            payload = resp.json()
+            code = payload.get("code")
+            if code not in (0, 200):
+                raise RuntimeError(f"create_session 涓氬姟閿欒: {payload}")
+
+            session_id = ((payload.get("data") or {}).get("sessionId") or "").strip()
+            if not session_id:
+                raise RuntimeError(f"create_session 缂哄皯 sessionId: {payload}")
+            return session_id, trace
+        except RuntimeError:
+            raise
+        except requests.exceptions.HTTPError as exc:
+            last_error = exc
+            status_code = int(exc.response.status_code or 0) if exc.response is not None else 0
+            if status_code == 401:
+                raise RuntimeError(
+                    "create_session unauthorized(401); check token/uid/email alignment and token expiry."
+                ) from exc
+            if _should_retry_transient_http_status(status_code) and attempt < max_retries:
+                _sleep_with_retry_backoff(attempt + 1)
+                continue
+            raise
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            last_error = exc
+            if attempt < max_retries:
+                _sleep_with_retry_backoff(attempt + 1)
+                continue
+            raise
+        finally:
+            if resp is not None:
+                resp.close()
+
+    raise RuntimeError(f"create_session failed after retries: {last_error}")
+
+
+def _extract_ui_event_meta(ui_event: Any) -> tuple[str, int]:
+    if not isinstance(ui_event, dict):
+        return "", 0
+    seq = _coerce_int(ui_event.get("seq"))
+    data_obj = ui_event.get("data")
+    if isinstance(data_obj, dict):
+        inner = data_obj.get("data")
+        if isinstance(inner, dict):
+            return str(inner.get("type") or ""), seq
+        t = str(data_obj.get("type") or "")
+        if t:
+            return t, seq
+    return str(ui_event.get("type") or ""), seq
+
+
+def query_ui_events(
+    base_url: str,
+    headers: dict[str, str],
+    session_id: str,
+    since: int = 1,
+    until: int = 0,
+) -> list[dict[str, Any]]:
     if not session_id:
-        raise RuntimeError(f"create_session 缂哄皯 sessionId: {payload}")
-    return session_id, trace
+        return []
+    url = f"{base_url}/v1/lorevo/query_ui_events/{session_id}"
+    params: dict[str, Any] = {"since": max(1, _coerce_int(since))}
+    until_value = _coerce_int(until)
+    if until_value > 0:
+        params["until"] = until_value
+
+    connect_timeout_sec = max(3, min(60, _env_int("AUTO_TEST_HTTP_CONNECT_TIMEOUT_SEC", 15)))
+    read_timeout_sec = max(
+        connect_timeout_sec + 1,
+        min(180, _env_int("AUTO_TEST_QUERY_UI_EVENTS_READ_TIMEOUT_SEC", 45)),
+    )
+    max_retries = max(0, min(3, _env_int("AUTO_TEST_QUERY_UI_EVENTS_RETRIES", 3)))
+    last_error: Exception | None = None
+
+    for attempt in range(0, max_retries + 1):
+        resp = None
+        try:
+            resp = requests.get(
+                url,
+                headers=headers,
+                params=params,
+                timeout=(connect_timeout_sec, read_timeout_sec),
+            )
+            status_code = int(resp.status_code or 0)
+            if status_code == 401:
+                raise RuntimeError(
+                    "query_ui_events unauthorized(401); check token/uid/email alignment and token expiry."
+                )
+            if _should_retry_transient_http_status(status_code) and attempt < max_retries:
+                _sleep_with_retry_backoff(attempt + 1)
+                continue
+            resp.raise_for_status()
+
+            payload = resp.json()
+            code = payload.get("code")
+            if code not in (0, 200):
+                raise RuntimeError(f"query_ui_events 业务错误: {payload}")
+            data = payload.get("data")
+            events = data.get("events") if isinstance(data, dict) else []
+            if not isinstance(events, list):
+                return []
+            return [item for item in events if isinstance(item, dict)]
+        except RuntimeError:
+            raise
+        except requests.exceptions.HTTPError as exc:
+            last_error = exc
+            status_code = int(exc.response.status_code or 0) if exc.response is not None else 0
+            if status_code == 401:
+                raise RuntimeError(
+                    "query_ui_events unauthorized(401); check token/uid/email alignment and token expiry."
+                ) from exc
+            if _should_retry_transient_http_status(status_code) and attempt < max_retries:
+                _sleep_with_retry_backoff(attempt + 1)
+                continue
+            raise
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as exc:
+            last_error = exc
+            if attempt < max_retries:
+                _sleep_with_retry_backoff(attempt + 1)
+                continue
+            raise
+        finally:
+            if resp is not None:
+                resp.close()
+
+    raise RuntimeError(f"query_ui_events failed after retries: {last_error}")
+
+
+def reconcile_session_terminal_state(
+    base_url: str,
+    headers: dict[str, str],
+    session_id: str,
+    since_seq: int,
+    grace_sec: float,
+    poll_sec: float = 1.0,
+) -> dict[str, Any]:
+    since_value = max(1, _coerce_int(since_seq))
+    grace_value = max(0.0, min(180.0, float(grace_sec)))
+    poll_value = max(0.2, min(10.0, float(poll_sec)))
+    started = time.time()
+    deadline = started + grace_value
+    reconcile: dict[str, Any] = {
+        "attempted": False,
+        "status": "not_attempted",
+        "since_seq": since_value,
+        "grace_sec": round(grace_value, 3),
+        "poll_sec": round(poll_value, 3),
+        "attempt_count": 0,
+        "query_ok": False,
+        "query_error": "",
+        "events_seen": 0,
+        "server_last_event_type": "",
+        "server_last_event_seq": 0,
+        "terminal_found": False,
+        "terminal_event_type": "",
+        "terminal_event_seq": 0,
+    }
+    if not session_id:
+        reconcile["status"] = "skipped_no_session_id"
+        return reconcile
+
+    while True:
+        reconcile["attempted"] = True
+        reconcile["attempt_count"] = _coerce_int(reconcile.get("attempt_count")) + 1
+        try:
+            events = query_ui_events(
+                base_url=base_url,
+                headers=headers,
+                session_id=session_id,
+                since=since_value,
+                until=0,
+            )
+            reconcile["query_ok"] = True
+            reconcile["events_seen"] = len(events)
+            if events:
+                last_type, last_seq = _extract_ui_event_meta(events[-1])
+                reconcile["server_last_event_type"] = last_type
+                reconcile["server_last_event_seq"] = last_seq
+                for item in reversed(events):
+                    event_type, seq = _extract_ui_event_meta(item)
+                    if event_type in TERMINAL_EVENT_TYPES:
+                        reconcile["terminal_found"] = True
+                        reconcile["terminal_event_type"] = event_type
+                        reconcile["terminal_event_seq"] = seq
+                        reconcile["status"] = "terminal_found"
+                        break
+            if reconcile.get("terminal_found"):
+                break
+            reconcile["status"] = "not_terminal_yet"
+        except Exception as exc:
+            reconcile["query_ok"] = False
+            reconcile["query_error"] = f"{exc.__class__.__name__}:{exc}"
+            reconcile["status"] = "query_error"
+
+        now = time.time()
+        if now >= deadline:
+            break
+        time.sleep(min(poll_value, max(0.05, deadline - now)))
+
+    if not reconcile.get("terminal_found"):
+        if reconcile.get("status") == "query_error":
+            reconcile["status"] = "grace_timeout_with_query_error"
+        else:
+            reconcile["status"] = "grace_timeout"
+    reconcile["elapsed_sec"] = round(time.time() - started, 3)
+    return reconcile
+
+
+def cancel_session(
+    base_url: str,
+    headers: dict[str, str],
+    session_id: str,
+) -> dict[str, Any]:
+    cancel_info: dict[str, Any] = {
+        "attempted": False,
+        "ok": False,
+        "status": "not_attempted",
+        "http_status": 0,
+        "response_code": None,
+        "response_msg": "",
+        "error": "",
+    }
+    if not session_id:
+        cancel_info["status"] = "skipped_no_session_id"
+        return cancel_info
+
+    url = f"{base_url}/v1/lorevo/cancel/{session_id}"
+    connect_timeout_sec = max(3, min(60, _env_int("AUTO_TEST_HTTP_CONNECT_TIMEOUT_SEC", 15)))
+    read_timeout_sec = max(
+        connect_timeout_sec + 1,
+        min(120, _env_int("AUTO_TEST_CANCEL_READ_TIMEOUT_SEC", 30)),
+    )
+    max_retries = max(0, min(3, _env_int("AUTO_TEST_CANCEL_RETRIES", 1)))
+
+    for attempt in range(0, max_retries + 1):
+        cancel_info["attempted"] = True
+        cancel_info["attempt"] = attempt + 1
+        resp = None
+        try:
+            resp = requests.post(
+                url,
+                headers=headers,
+                timeout=(connect_timeout_sec, read_timeout_sec),
+            )
+            status_code = int(resp.status_code or 0)
+            cancel_info["http_status"] = status_code
+            if status_code == 401:
+                cancel_info["status"] = "cancel_unauthorized"
+                cancel_info["error"] = "cancel unauthorized(401)"
+                break
+            if _should_retry_transient_http_status(status_code) and attempt < max_retries:
+                _sleep_with_retry_backoff(attempt + 1)
+                continue
+            resp.raise_for_status()
+            payload = resp.json()
+            code = payload.get("code")
+            msg = str(payload.get("msg") or "")
+            cancel_info["response_code"] = code
+            cancel_info["response_msg"] = msg
+            if code in (0, 200):
+                cancel_info["ok"] = True
+                cancel_info["status"] = "cancel_ok"
+            else:
+                cancel_info["status"] = "cancel_business_error"
+                cancel_info["error"] = f"cancel business error: {payload}"
+            break
+        except requests.exceptions.HTTPError as exc:
+            status_code = int(exc.response.status_code or 0) if exc.response is not None else 0
+            cancel_info["http_status"] = status_code
+            cancel_info["error"] = f"HTTPError:{exc}"
+            if _should_retry_transient_http_status(status_code) and attempt < max_retries:
+                _sleep_with_retry_backoff(attempt + 1)
+                continue
+            cancel_info["status"] = "cancel_http_error"
+            break
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.RequestException) as exc:
+            cancel_info["error"] = f"{exc.__class__.__name__}:{exc}"
+            if attempt < max_retries:
+                _sleep_with_retry_backoff(attempt + 1)
+                continue
+            cancel_info["status"] = "cancel_request_exception"
+            break
+        finally:
+            if resp is not None:
+                resp.close()
+
+    if not cancel_info.get("attempted"):
+        cancel_info["status"] = "cancel_not_attempted"
+    elif not cancel_info.get("status") or cancel_info.get("status") == "not_attempted":
+        cancel_info["status"] = "cancel_unknown"
+    return cancel_info
 
 
 def _extract_interact_tool_call(event: dict[str, Any]) -> dict[str, Any] | None:
@@ -1220,6 +1793,14 @@ def execute_turn(
     url = f"{base_url}/v1/lorevo/execute_session"
     started = time.time()
     overall_timeout_sec = max(60, min(900, _env_int("AUTO_TEST_TURN_TIMEOUT_SEC", 240)))
+    connect_timeout_sec = max(3, min(60, _env_int("AUTO_TEST_HTTP_CONNECT_TIMEOUT_SEC", 15)))
+    stream_read_timeout_sec = max(
+        connect_timeout_sec + 1,
+        min(1800, _env_int("AUTO_TEST_STREAM_READ_TIMEOUT_SEC", overall_timeout_sec + 30)),
+    )
+    max_execute_retries = max(0, min(3, _env_int("AUTO_TEST_EXECUTE_TRANSIENT_RETRIES", 3)))
+    terminal_reconcile_grace_sec = max(0.0, min(180.0, _env_float("AUTO_TEST_TERMINAL_RECONCILE_GRACE_SEC", 90.0)))
+    terminal_reconcile_poll_sec = max(0.2, min(10.0, _env_float("AUTO_TEST_TERMINAL_RECONCILE_POLL_SEC", 1.0)))
     simulate_interact_callback = _env_bool("AUTO_TEST_SIMULATE_INTERACT_CALLBACK", True)
     max_sim_callback_rounds = max(
         0,
@@ -1233,6 +1814,8 @@ def execute_turn(
     event_count = 0
     run_end = False
     run_error = ""
+    run_end_inferred = False
+    run_end_infer_reason = ""
     assistant_final = ""
     assistant_deltas: list[str] = []
     callback_rounds = 0
@@ -1244,6 +1827,37 @@ def execute_turn(
     first_trace: TraceInfo | None = None
     last_trace: TraceInfo | None = None
     event_workspace_paths: set[str] = set()
+    event_text_by_path: dict[str, str] = {}
+    event_image_paths: set[str] = set()
+    first_event_seq = 0
+    last_event_seq = 0
+    last_event_type = ""
+    terminal_event_type = ""
+    seen_any_text_output = False
+    saw_compaction_tool_start = False
+    saw_compaction_done_text = False
+    terminal_reconcile: dict[str, Any] = {
+        "attempted": False,
+        "status": "not_needed",
+        "since_seq": 0,
+        "terminal_found": False,
+        "terminal_event_type": "",
+        "terminal_event_seq": 0,
+    }
+    terminal_missing = False
+    run_error_before_terminal_reconcile = ""
+
+    def _infer_run_end_when_compaction_done(reason: str) -> bool:
+        nonlocal run_end, run_end_inferred, run_end_infer_reason, run_error
+        if not saw_compaction_tool_start:
+            return False
+        if not (saw_compaction_done_text or _looks_like_compaction_done_text(assistant_final)):
+            return False
+        run_end = True
+        run_end_inferred = True
+        run_end_infer_reason = reason
+        run_error = ""
+        return True
 
     while True:
         req_body = {
@@ -1253,91 +1867,214 @@ def execute_turn(
             "messages": pending_messages,
             "exec": {"maxTurns": exec_max_turns},
         }
-        resp = requests.post(url, headers=headers, json=req_body, stream=True, timeout=180)
-        trace = trace_info_from_response(resp)
-        if first_trace is None:
-            first_trace = trace
-        last_trace = trace
-        request_ids.append(trace.request_id)
-        backend_trace_ids.append(trace.backend_trace_id)
-        traceparents.append(trace.traceparent)
-        tracestates.append(trace.tracestate)
-        x_trace_ids.append(trace.x_trace_id)
-        resp.raise_for_status()
-
         run_end = False
         pending_tool_call: dict[str, Any] | None = None
-        for raw in resp.iter_lines(decode_unicode=True):
-            if raw is None:
-                continue
-            line = raw.strip()
-            if not line:
-                continue
-            if line.startswith(":"):
-                continue
-            if not line.startswith("data:"):
-                continue
-
-            payload = line[5:].strip()
-            ui = extract_ui_event(payload)
-            if not ui:
-                continue
-            event_count += 1
-
-            data_wrap = ui.get("data")
-            event = data_wrap.get("data") if isinstance(data_wrap, dict) else None
-            if not isinstance(event, dict):
-                continue
-
-            event_type = str(event.get("type") or "")
-            role = str(event.get("role") or "")
-            content = event.get("content")
-            if event_type not in {"TOOL_CALL_DELTA", "TEXT_DELTA"}:
-                event_workspace_paths.update(extract_workspace_paths(json.dumps(event, ensure_ascii=False)))
-
-            raw_events_fp.write(
-                json.dumps(
-                    {
-                        "time": datetime.now().isoformat(timespec="seconds"),
-                        "turn": turn_idx,
-                        "callback_round": callback_rounds,
-                        "request_id": trace.request_id,
-                        "traceparent": trace.traceparent,
-                        "backend_trace_id": trace.backend_trace_id,
-                        "session_id": session_id,
-                        "event_type": event_type,
-                        "event_role": role,
-                        "event_seq": ui.get("seq"),
-                        "event_sub_seq": ui.get("subSeq", ui.get("sub_seq")),
-                        "event_raw": event,
-                    },
-                    ensure_ascii=False,
+        trace = last_trace or first_trace or TraceInfo("", "", "", "", "")
+        request_attempt = 0
+        while True:
+            request_event_baseline = event_count
+            retry_current_request = False
+            resp = None
+            try:
+                resp = requests.post(
+                    url,
+                    headers=headers,
+                    json=req_body,
+                    stream=True,
+                    timeout=(connect_timeout_sec, stream_read_timeout_sec),
                 )
-                + "\n"
-            )
+                trace = trace_info_from_response(resp)
+                if first_trace is None:
+                    first_trace = trace
+                last_trace = trace
+                request_ids.append(trace.request_id)
+                backend_trace_ids.append(trace.backend_trace_id)
+                traceparents.append(trace.traceparent)
+                tracestates.append(trace.tracestate)
+                x_trace_ids.append(trace.x_trace_id)
 
-            if event_type == "TEXT_DELTA":
-                if isinstance(content, str) and content:
-                    assistant_deltas.append(content)
-            elif event_type == "TEXT":
-                if role.lower() != "user" and isinstance(content, str) and content:
-                    assistant_final = content
-            elif event_type == "TOOL_CALL":
-                maybe_call = _extract_interact_tool_call(event)
-                if maybe_call is not None:
-                    pending_tool_call = maybe_call
-            elif event_type == "RUN_ERROR":
-                run_error = str(event.get("message") or "RUN_ERROR")
-                break
-            elif event_type == "RUN_END":
-                run_end = True
-                break
+                status_code = int(resp.status_code or 0)
+                if status_code == 401:
+                    run_error = "AUTH_401_UNAUTHORIZED"
+                elif _should_retry_transient_http_status(status_code) and request_attempt < max_execute_retries:
+                    retry_current_request = True
+                else:
+                    resp.raise_for_status()
+                    for raw in resp.iter_lines(decode_unicode=True):
+                        if time.time() - started > overall_timeout_sec:
+                            if (pending_tool_call is None) and _infer_run_end_when_compaction_done(
+                                "inferred_after_compaction_done_text_on_timeout"
+                            ):
+                                break
+                            run_error = f"TURN_TIMEOUT_{overall_timeout_sec}s"
+                            break
 
-            if time.time() - started > overall_timeout_sec:
-                run_error = f"TURN_TIMEOUT_{overall_timeout_sec}s"
-                break
+                        if raw is None:
+                            continue
+                        line = raw.strip()
+                        if not line:
+                            continue
+                        if line.startswith(":"):
+                            continue
+                        if not line.startswith("data:"):
+                            continue
 
-        resp.close()
+                        payload = line[5:].strip()
+                        ui = extract_ui_event(payload)
+                        if not ui:
+                            continue
+                        event_count += 1
+
+                        data_wrap = ui.get("data")
+                        event = data_wrap.get("data") if isinstance(data_wrap, dict) else None
+                        if not isinstance(event, dict):
+                            continue
+
+                        event_type = str(event.get("type") or "")
+                        role = str(event.get("role") or "")
+                        content = event.get("content")
+                        seq_value = _coerce_int(ui.get("seq"))
+                        if seq_value > 0:
+                            if first_event_seq <= 0:
+                                first_event_seq = seq_value
+                            if seq_value >= last_event_seq:
+                                last_event_seq = seq_value
+                        if event_type:
+                            last_event_type = event_type
+                        if event_type not in {"TOOL_CALL_DELTA", "TEXT_DELTA"}:
+                            event_workspace_paths.update(extract_workspace_paths(json.dumps(event, ensure_ascii=False)))
+                        if event_type == "TOOL_CALL":
+                            tool_name = str(event.get("toolCallName") or event.get("tool_call_name") or "").strip()
+                            if tool_name in {"write", "edit"}:
+                                args_raw = event.get("args")
+                                args: dict[str, Any] = {}
+                                if isinstance(args_raw, dict):
+                                    args = args_raw
+                                elif isinstance(args_raw, str):
+                                    parsed_args = _safe_json_loads(args_raw)
+                                    if isinstance(parsed_args, dict):
+                                        args = parsed_args
+                                if isinstance(args, dict):
+                                    file_path = str(args.get("filePath") or args.get("path") or "").strip()
+                                    if file_path.startswith("/workspace/") and not file_path.endswith("/"):
+                                        new_text = args.get("newText")
+                                        if new_text is None:
+                                            new_text = args.get("content")
+                                        if isinstance(new_text, str):
+                                            event_text_by_path[file_path] = new_text
+                                            event_workspace_paths.add(file_path)
+                            if tool_name == "image_gen_edit":
+                                args_raw = event.get("args")
+                                args = {}
+                                if isinstance(args_raw, dict):
+                                    args = args_raw
+                                elif isinstance(args_raw, str):
+                                    parsed_args = _safe_json_loads(args_raw)
+                                    if isinstance(parsed_args, dict):
+                                        args = parsed_args
+                                if isinstance(args, dict):
+                                    for key in ("outputPath", "savePath"):
+                                        v = str(args.get(key) or "").strip()
+                                        if v.startswith("/workspace/") and not v.endswith("/"):
+                                            event_image_paths.add(v)
+                                            event_workspace_paths.add(v)
+                                    out_paths = args.get("outputPaths")
+                                    if isinstance(out_paths, list):
+                                        for item in out_paths:
+                                            v = str(item or "").strip()
+                                            if v.startswith("/workspace/") and not v.endswith("/"):
+                                                event_image_paths.add(v)
+                                                event_workspace_paths.add(v)
+                        elif event_type == "TOOL_RESULT":
+                            tool_name = str(event.get("toolCallName") or event.get("tool_call_name") or "").strip()
+                            if tool_name == "image_gen_edit":
+                                result_obj = event.get("result")
+                                if isinstance(result_obj, dict):
+                                    data_obj = result_obj.get("data")
+                                    if isinstance(data_obj, dict):
+                                        results_list = data_obj.get("results")
+                                        if isinstance(results_list, list):
+                                            for item in results_list:
+                                                if not isinstance(item, dict):
+                                                    continue
+                                                p = str(item.get("path") or "").strip()
+                                                if p.startswith("/workspace/") and not p.endswith("/"):
+                                                    event_image_paths.add(p)
+                                                    event_workspace_paths.add(p)
+
+                        raw_events_fp.write(
+                            json.dumps(
+                                {
+                                    "time": datetime.now().isoformat(timespec="seconds"),
+                                    "turn": turn_idx,
+                                    "callback_round": callback_rounds,
+                                    "request_id": trace.request_id,
+                                    "traceparent": trace.traceparent,
+                                    "backend_trace_id": trace.backend_trace_id,
+                                    "session_id": session_id,
+                                    "event_type": event_type,
+                                    "event_role": role,
+                                    "event_seq": ui.get("seq"),
+                                    "event_sub_seq": ui.get("subSeq", ui.get("sub_seq")),
+                                    "event_raw": event,
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+
+                        if event_type == "TEXT_DELTA":
+                            if isinstance(content, str) and content:
+                                assistant_deltas.append(content)
+                                seen_any_text_output = True
+                        elif event_type == "TEXT":
+                            if role.lower() != "user" and isinstance(content, str) and content:
+                                assistant_final = content
+                                seen_any_text_output = True
+                                if _looks_like_compaction_done_text(content):
+                                    saw_compaction_done_text = True
+                        elif event_type == "TOOL_CALL":
+                            maybe_call = _extract_interact_tool_call(event)
+                            if maybe_call is not None:
+                                pending_tool_call = maybe_call
+                        elif event_type == "TOOL_CALL_START":
+                            tool_name = str(event.get("toolCallName") or event.get("tool_call_name") or "").strip()
+                            if tool_name in COMPACTION_TOOL_NAMES:
+                                saw_compaction_tool_start = True
+                        elif event_type == "RUN_ERROR":
+                            terminal_event_type = "RUN_ERROR"
+                            run_error = str(event.get("message") or "RUN_ERROR")
+                            break
+                        elif event_type == "RUN_END":
+                            terminal_event_type = "RUN_END"
+                            run_end = True
+                            break
+            except requests.exceptions.HTTPError as exc:
+                status_code = int(exc.response.status_code or 0) if exc.response is not None else 0
+                if status_code == 401:
+                    run_error = "AUTH_401_UNAUTHORIZED"
+                elif (
+                    _should_retry_transient_http_status(status_code)
+                    and request_attempt < max_execute_retries
+                    and event_count == request_event_baseline
+                ):
+                    retry_current_request = True
+                else:
+                    run_error = f"EXECUTE_HTTP_ERROR:{status_code}:{exc}"
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout, requests.exceptions.RequestException) as exc:
+                if request_attempt < max_execute_retries and event_count == request_event_baseline:
+                    retry_current_request = True
+                else:
+                    run_error = f"EXECUTE_REQUEST_EXCEPTION:{exc.__class__.__name__}:{exc}"
+            finally:
+                if resp is not None:
+                    resp.close()
+
+            if retry_current_request:
+                request_attempt += 1
+                _sleep_with_retry_backoff(request_attempt)
+                continue
+            break
 
         if run_error:
             break
@@ -1386,11 +2123,54 @@ def execute_turn(
             break
 
         if time.time() - started > overall_timeout_sec:
+            if (pending_tool_call is None) and _infer_run_end_when_compaction_done(
+                "inferred_after_compaction_done_text_on_timeout"
+            ):
+                break
             run_error = f"TURN_TIMEOUT_{overall_timeout_sec}s"
+            break
+
+        if (
+            not pending_tool_call
+            and seen_any_text_output
+            and _infer_run_end_when_compaction_done("inferred_after_compaction_done_text_on_stream_close")
+        ):
             break
 
         run_error = "STREAM_CLOSED_BEFORE_RUN_END"
         break
+
+    if (not terminal_event_type) and first_event_seq > 0:
+        should_reconcile = bool(run_error or run_end_inferred or (not run_end))
+        if should_reconcile:
+            terminal_reconcile = reconcile_session_terminal_state(
+                base_url=base_url,
+                headers=headers,
+                session_id=session_id,
+                since_seq=first_event_seq,
+                grace_sec=terminal_reconcile_grace_sec,
+                poll_sec=terminal_reconcile_poll_sec,
+            )
+            if _cfg_bool(terminal_reconcile.get("terminal_found"), False):
+                terminal_event_type = str(terminal_reconcile.get("terminal_event_type") or "")
+                if terminal_event_type == "RUN_END":
+                    if run_error:
+                        run_error_before_terminal_reconcile = run_error
+                    run_error = ""
+                    run_end = True
+                elif terminal_event_type == "RUN_ERROR" and not run_error:
+                    run_error = "RUN_ERROR(server_reconciled)"
+            terminal_missing = terminal_event_type not in TERMINAL_EVENT_TYPES
+    elif not terminal_event_type:
+        terminal_reconcile = {
+            "attempted": False,
+            "status": "skipped_no_first_event_seq",
+            "since_seq": 0,
+            "terminal_found": False,
+            "terminal_event_type": "",
+            "terminal_event_seq": 0,
+        }
+        terminal_missing = False
 
     if not assistant_final and assistant_deltas:
         assistant_final = "".join(assistant_deltas)
@@ -1400,6 +2180,8 @@ def execute_turn(
         headers=headers,
         session_id=session_id,
         event_paths=sorted(event_workspace_paths),
+        event_text_by_path=event_text_by_path,
+        event_image_paths=sorted(event_image_paths),
     )
 
     primary_trace = first_trace or TraceInfo("", "", "", "", "")
@@ -1422,12 +2204,25 @@ def execute_turn(
         "user_text": user_text,
         "assistant_text": assistant_final,
         "event_count": event_count,
+        "first_event_seq": first_event_seq,
+        "last_event_seq": last_event_seq,
+        "last_event_type": last_event_type,
+        "terminal_event_type": terminal_event_type,
+        "terminal_event_seen": terminal_event_type in TERMINAL_EVENT_TYPES,
+        "terminal_reconcile": terminal_reconcile,
+        "terminal_missing": terminal_missing,
+        "run_error_before_terminal_reconcile": run_error_before_terminal_reconcile,
         "run_end": run_end,
+        "run_end_inferred": run_end_inferred,
+        "run_end_infer_reason": run_end_infer_reason,
         "run_error": run_error,
         "callback_rounds": callback_rounds,
         "simulate_interact_callback": simulate_interact_callback,
         "max_sim_callback_rounds": max_sim_callback_rounds,
         "turn_timeout_sec": overall_timeout_sec,
+        "http_connect_timeout_sec": connect_timeout_sec,
+        "stream_read_timeout_sec": stream_read_timeout_sec,
+        "execute_transient_retries": max_execute_retries,
         "workspace_event_paths": sorted(event_workspace_paths)[:200],
         "workspace_snapshot": workspace_snapshot,
         "duration_sec": duration_sec,
@@ -1600,6 +2395,7 @@ def write_meta_md(
     probe_eval: dict[str, Any] | None = None,
 ) -> None:
     ok_turns = sum(1 for r in results if r.get("run_end") and not r.get("run_error"))
+    auth_ctx = build_auth_context(cfg.token, cfg.uid, cfg.email)
     lines = [
         "# Dialogue Test Metadata",
         "",
@@ -1612,6 +2408,12 @@ def write_meta_md(
         f"- uid: `{cfg.uid}`",
         f"- email: `{cfg.email}`",
         f"- token(masked): `{mask_token(cfg.token)}`",
+        f"- token_uid: `{auth_ctx.get('token_uid') or ''}`",
+        f"- token_email: `{auth_ctx.get('token_email') or ''}`",
+        f"- token_exp_utc: `{auth_ctx.get('token_exp_utc') or ''}`",
+        f"- token_expired: `{auth_ctx.get('token_expired')}`",
+        f"- uid_match: `{auth_ctx.get('uid_match')}`",
+        f"- email_match: `{auth_ctx.get('email_match')}`",
         f"- runtime_env: `{cfg.selected_env}`",
         f"- config_source: `{cfg.source_path.as_posix()}`",
         f"- created_at: `{datetime.now().isoformat(timespec='seconds')}`",
@@ -1623,6 +2425,7 @@ def write_meta_md(
         f"- user_simulator_base_url: `{user_sim_cfg.base_url}`",
         f"- user_simulator_user_temperature: `{user_sim_cfg.user_temperature}`",
         f"- user_simulator_role_temperature: `{user_sim_cfg.role_temperature}`",
+        f"- first_user_message: `{user_sim_cfg.first_user_message}`",
         f"- generated_role_name: `{generated_role.role_name}`",
         f"- generated_role_json: `{json.dumps(generated_role.role_json, ensure_ascii=False, sort_keys=True)}`",
         "- generated_role_profile:",
@@ -1643,13 +2446,16 @@ def write_meta_md(
         "",
         "## Turn Status",
         "",
-        "| turn | request_id | backend_trace_id | run_end | run_error | event_count | duration_sec |",
-        "| --- | --- | --- | --- | --- | --- | --- |",
+        "| turn | request_id | backend_trace_id | run_end | run_end_inferred | terminal_event_type | terminal_missing | run_end_infer_reason | run_error | event_count | duration_sec |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for result in results:
         lines.append(
             f"| {result['turn']} | `{result['request_id']}` | `{result['backend_trace_id']}` | "
-            f"`{result['run_end']}` | `{result['run_error'] or ''}` | {result['event_count']} | {result['duration_sec']} |"
+            f"`{result['run_end']}` | `{result.get('run_end_inferred', False)}` | "
+            f"`{result.get('terminal_event_type', '')}` | `{result.get('terminal_missing', False)}` | "
+            f"`{result.get('run_end_infer_reason', '')}` | `{result['run_error'] or ''}` | "
+            f"{result['event_count']} | {result['duration_sec']} |"
         )
 
     lines.extend(
@@ -1734,12 +2540,27 @@ def write_dialogue_md(path: Path, results: list[dict[str, Any]]) -> None:
 
 def main() -> int:
     args = parse_runtime_args(sys.argv[1:])
+    if args.skip_preflight_cleanup or _env_bool("AUTO_TEST_SKIP_PREFLIGHT_CLEANUP", False):
+        print("[INFO] preflight_cleanup skipped by flag or env")
+    else:
+        preflight_cleanup_test_processes("run_5turn_session_test")
     cfg_path = resolve_config_path()
     cfg = load_config(cfg_path, args.env)
     applied_proxy = apply_proxy_from_config(cfg)
     dotai_base_url = resolve_dotai_base_url(cfg)
+    auth_ctx = build_auth_context(cfg.token, cfg.uid, cfg.email)
     print(f"[INFO] config_path={cfg.source_path.as_posix()}")
     print(f"[INFO] runtime_env={cfg.selected_env}")
+    print(
+        "[INFO] auth_context "
+        f"uid={cfg.uid} email={cfg.email} "
+        f"token_uid={auth_ctx.get('token_uid') or '(none)'} "
+        f"token_email={auth_ctx.get('token_email') or '(none)'} "
+        f"token_exp_utc={auth_ctx.get('token_exp_utc') or '(unknown)'} "
+        f"token_expired={auth_ctx.get('token_expired')} "
+        f"uid_match={auth_ctx.get('uid_match')} "
+        f"email_match={auth_ctx.get('email_match')}"
+    )
 
     run_id = f"{now_stamp()}_{uuid.uuid4().hex[:8]}"
     result_dir = AUTO_TEST_DIR / "results" / f"session_autotest_{run_id}"
@@ -1777,6 +2598,26 @@ def main() -> int:
     print(f"[INFO] persist_type={persist_type}")
     print(f"[INFO] exec_max_turns={exec_max_turns}")
     print(f"[INFO] turn_timeout_sec={max(60, min(900, _env_int('AUTO_TEST_TURN_TIMEOUT_SEC', 240)))}")
+    print(f"[INFO] http_connect_timeout_sec={max(3, min(60, _env_int('AUTO_TEST_HTTP_CONNECT_TIMEOUT_SEC', 15)))}")
+    print(
+        f"[INFO] stream_read_timeout_sec="
+        f"{max(4, min(1800, _env_int('AUTO_TEST_STREAM_READ_TIMEOUT_SEC', _env_int('AUTO_TEST_TURN_TIMEOUT_SEC', 240) + 30)))}"
+    )
+    print(f"[INFO] create_session_retries={max(0, min(3, _env_int('AUTO_TEST_CREATE_SESSION_RETRIES', 2)))}")
+    print(f"[INFO] execute_transient_retries={max(0, min(3, _env_int('AUTO_TEST_EXECUTE_TRANSIENT_RETRIES', 3)))}")
+    print(f"[INFO] query_ui_events_retries={max(0, min(3, _env_int('AUTO_TEST_QUERY_UI_EVENTS_RETRIES', 3)))}")
+    print(
+        f"[INFO] terminal_reconcile_grace_sec="
+        f"{max(0.0, min(180.0, _env_float('AUTO_TEST_TERMINAL_RECONCILE_GRACE_SEC', 90.0)))}"
+    )
+    print(
+        f"[INFO] terminal_reconcile_poll_sec="
+        f"{max(0.2, min(10.0, _env_float('AUTO_TEST_TERMINAL_RECONCILE_POLL_SEC', 1.0)))}"
+    )
+    break_on_run_error = _env_bool("AUTO_TEST_BREAK_ON_RUN_ERROR", True)
+    auto_cancel_on_run_error = _env_bool("AUTO_TEST_AUTO_CANCEL_ON_RUN_ERROR", True)
+    print(f"[INFO] break_on_run_error={break_on_run_error}")
+    print(f"[INFO] auto_cancel_on_run_error={auto_cancel_on_run_error}")
     print(f"[INFO] run_settings={json.dumps(run_settings, ensure_ascii=False, sort_keys=True)}")
     if create_settings_json:
         print(f"[INFO] create_settings={create_settings_json}")
@@ -1855,22 +2696,33 @@ def main() -> int:
         latest_workspace_snapshot: dict[str, Any] | None = None
 
         for idx in range(1, target_turns + 1):
-            if idx == 1:
-                user_text = user_sim_cfg.first_user_message
-            else:
-                try:
-                    user_text, should_stop, sim_state = generate_user_turn_with_simulator(
-                        sim_cfg=user_sim_cfg,
-                        sim_state=sim_state,
-                        results=results,
-                        role=generated_role,
-                        turn_idx=idx,
-                        workspace_snapshot=latest_workspace_snapshot,
-                    )
-                    if should_stop:
+            try:
+                user_text, should_stop, sim_state = generate_user_turn_with_simulator(
+                    sim_cfg=user_sim_cfg,
+                    sim_state=sim_state,
+                    results=results,
+                    role=generated_role,
+                    turn_idx=idx,
+                    workspace_snapshot=latest_workspace_snapshot,
+                )
+                if should_stop:
+                    if idx == 1:
+                        user_text = user_sim_cfg.first_user_message
+                        print(
+                            "[WARN] user_simulator requested stop at first turn; "
+                            "fallback to configured first_user_message."
+                        )
+                    else:
                         print(f"[INFO] user_simulator requested stop at turn={idx}")
                         break
-                except Exception as exc:
+            except Exception as exc:
+                if idx == 1:
+                    user_text = user_sim_cfg.first_user_message
+                    print(
+                        "[WARN] first turn generated by user_simulator failed; "
+                        f"fallback to configured first_user_message. reason={exc.__class__.__name__}"
+                    )
+                else:
                     raise RuntimeError(f"user_simulator turn={idx} 鐢熸垚澶辫触: {exc}") from exc
 
             print(f"[INFO] turn={idx}")
@@ -1904,6 +2756,20 @@ def main() -> int:
                     )
             if one.get("run_error"):
                 print(f"[WARN] turn={idx} run_error={one['run_error']}")
+                if auto_cancel_on_run_error:
+                    cancel_info = cancel_session(
+                        base_url=cfg.base_url,
+                        headers=headers,
+                        session_id=session_id,
+                    )
+                    one["auto_cancel"] = cancel_info
+                    print(
+                        "[INFO] auto_cancel "
+                        f"turn={idx} status={cancel_info.get('status')} ok={cancel_info.get('ok')}"
+                    )
+                if break_on_run_error:
+                    print(f"[INFO] stop_after_run_error turn={idx}")
+                    break
 
     workspace_export = export_workspace_view(
         base_url=cfg.base_url,

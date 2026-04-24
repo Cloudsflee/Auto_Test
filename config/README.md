@@ -48,7 +48,7 @@
 - `user_simulator.capability_mode`: 能力考核模式（`alternating` / `mixed` / `single_random` / `copy_only` / `image_only`）
 - `user_simulator.user_temperature`: 用户发言生成温度（建议 `0.7~1.2`）
 - `user_simulator.role_temperature`: 角色生成温度（建议 `0.8~1.3`）
-- `user_simulator.first_user_message`: first-turn user message. The first sentence is forcibly fixed to "请你把当前记忆文件重置为系统初始模板"; extra text is appended on the next line.
+- `user_simulator.first_user_message`: 首轮兜底开场语。默认首轮由角色模拟 LLM 生成；仅当首轮生成失败或返回 stop/空文本时回退到该文案（不会自动注入“清空/重置记忆文件”指令）。
 - `user_simulator.system_prompt_file`: system 提示词文件名（相对 `prompts/`，默认 `framework/simulator/system/user_simulator_system.prompt`）
 - `user_simulator.scenario_prompt_file`: 可选场景模板文件（未配置时自动由 `targets/<target_name>/scenarios/*.yaml` 组装）
 - `user_simulator.role_system_prompt_file`: 角色生成 system 提示词文件名（默认 `framework/simulator/role_generation/role_system.prompt`）
@@ -192,15 +192,15 @@ New shadow output fields:
 
 ## Environment Switch (prod/test)
 
-- Default runtime environment is `prod`.
+- Default runtime environment is `test`.
 - You can switch environment in two ways:
-  1. CLI: `python auto_test/src/tests/run_5turn_session_test.py --env test`
-  2. Env var: `AUTO_TEST_ENV=test`
+  1. CLI: `python auto_test/src/tests/run_5turn_session_test.py --env prod`
+  2. Env var: `AUTO_TEST_ENV=prod`
 - Priority:
   1. `--env`
   2. `AUTO_TEST_ENV`
   3. `config.active_env`
-  4. fallback `prod`
+  4. fallback `test`
 
 Config schema (JSON):
 

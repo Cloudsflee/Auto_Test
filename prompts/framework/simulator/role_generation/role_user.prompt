@@ -1,9 +1,8 @@
-请生成一个“本轮测试专用”的随机客户角色，用于后续多轮对话。
+请生成一个“本轮测试专用”的随机用户角色，用于后续多轮对话模拟。
 
 上下文：
 - target: {{TARGET_NAME}}
 - 本轮最大对话数：{{MAX_TURNS}}
-- 首轮固定用户动作：{{REQUIRED_NOTEBOOK_CLEAR_TEXT}}
 
 target 能力边界参考（来自 policies）：
 {{TARGET_POLICIES}}
@@ -20,16 +19,17 @@ target 用户画像样本（可借鉴但禁止照抄）：
 2. 必须给出至少 2 条硬约束（预算、时间、合规、品牌调性、团队资源等）。
 3. 必须给出至少 1 组目标冲突（例如“要快又要高质量”“要省钱又要高级感”）。
 4. 沟通风格要可扮演且具体，包含语气特征和常用表达习惯。
-5. 每次输出必须显著不同，避免模板化。
+5. 角色应保持多样但合理，避免极端随机导致不自然。
 
 输出要求（严格）：
 1. 只输出 JSON，不要 Markdown、解释、代码块。
 2. 字段必须齐全且非空，constraints / success_criteria / speaking_habits 至少各 2 条。
+3. 使用 `domain_context` 表达用户带入该 target 的场景背景（比 business_background 更通用）。
 
 {
   "role_name": "...",
   "identity": "...",
-  "business_background": "...",
+  "domain_context": "...",
   "communication_style": "...",
   "current_goal": "...",
   "constraints": ["...", "..."],

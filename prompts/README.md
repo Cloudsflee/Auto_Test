@@ -85,8 +85,8 @@ prompts/
 
 说明：
 
-1. `scenario_prompt_file` 是可选项；不配置时，系统会用内置 scenario 模板并注入 target 内容。
-2. `framework/simulator/system/scenario_template.prompt` 是可选文件；不存在时仍可运行（代码内置模板兜底）。
+1. `scenario_prompt_file` 是可选项；不配置时，系统默认读取 `framework/simulator/system/scenario_template.prompt` 并注入 target 内容。
+2. `framework/simulator/system/scenario_template.prompt` 当前已提供；若缺失，代码仍可回退到内置中文模板。
 
 ## 4. 占位符清单与来源
 
@@ -110,7 +110,7 @@ prompts/
 ### 4.3 用户模拟与角色生成（simulator）
 
 1. `{{MAX_TURNS}}`：本轮测试上限。
-2. `{{REQUIRED_NOTEBOOK_CLEAR_TEXT}}`：首轮固定动作文本。
+2. `{{REQUIRED_NOTEBOOK_CLEAR_TEXT}}`：历史兼容占位符（已废弃，不建议在 framework role-generation 模板继续使用）。
 3. `{{CAPABILITY_MODE}}`：能力考验模式（如 alternating）。
 4. `{{CAPABILITY_POLICY}}`：能力模式对应策略文本。
 5. `{{TARGET_NAME}}`：当前 target 名称。
@@ -120,6 +120,11 @@ prompts/
 9. `{{TARGET_RUBRICS}}`：`targets/<target>/rubrics/probe_rubrics.yaml` 内容。
 10. `{{INDUSTRY_OPTIONS}}`：行业随机池（可由配置覆盖）。
 11. `{{IDENTITY_OPTIONS}}`：身份随机池（可由配置覆盖）。
+
+补充：
+
+1. `framework/simulator/system/user_simulator_system.prompt` 与 `framework/simulator/system/scenario_template.prompt` 当前统一使用中文模板。
+2. 若 `scenario_template.prompt` 缺失，代码会回退到中文内置默认模板。
 
 ## 5. 新增一个 target 的步骤
 

@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import json
 import re
@@ -34,6 +34,7 @@ class UserSimulatorConfig:
 @dataclass
 class UserSimulatorState:
     previous_response_id: str
+    provider_context_unsupported: bool = False
 
 
 @dataclass
@@ -88,14 +89,14 @@ def normalize_capability_mode(raw: Any) -> str:
 def capability_policy_text(mode: str) -> str:
     m = normalize_capability_mode(mode)
     if m == "copy_only":
-        return "本轮及后续轮次只考查文案撰写能力，不发起图片生成要求。"
+        return "Only evaluate copywriting generation in this turn and follow-up turns."
     if m == "image_only":
-        return "本轮及后续轮次只考查图片生成/编辑能力，不发起纯文案交付要求。"
+        return "Only evaluate image generation/editing in this turn and follow-up turns."
     if m == "mixed":
-        return "每轮都要至少覆盖文案或图片中的一项；在全局上尽量两项都出现。"
+        return "Each turn should cover either copywriting or image generation; both should appear globally."
     if m == "single_random":
-        return "每轮仅考查一项能力（文案或图片），由你随机选择，避免连续 2 轮同一能力。"
-    return "按轮次交替考查：奇数轮优先文案，偶数轮优先图片生成。"
+        return "Evaluate only one capability each turn (copy or image), avoid same capability for too many turns."
+    return "Alternate by turn: odd turns prioritize copywriting, even turns prioritize image generation."
 
 
 def capability_focus_for_turn(mode: str, turn_idx: int) -> str:
@@ -304,14 +305,18 @@ def _call_user_sim_model(
                 raise RuntimeError("user_simulator empty content")
             return content, payload
         except Exception as exc:
+            if isinstance(exc, requests.HTTPError):
+                status_code = int(getattr(getattr(exc, "response", None), "status_code", 0) or 0)
+                # 4xx are non-transient request-shape issues; fail fast and let caller fallback.
+                if 400 <= status_code < 500:
+                    raise RuntimeError(f"user_simulator client_error_{status_code}: {exc}") from exc
             last_error = exc
             if attempt >= max_retries:
                 break
-            # 网络抖动（如 WinError 10054）时退避重试，降低长轮次中断概率。
+            # 网络抖动时退避重试，降低长轮次中断概率。
             sleep_sec = retry_backoff_sec * (attempt + 1)
             time.sleep(sleep_sec)
     raise RuntimeError(f"user_simulator model call failed: {last_error}") from last_error
-
 
 def _build_role_profile(role_json: dict[str, Any]) -> str:
     def pick(name: str, fallback: str = "") -> str:
@@ -327,36 +332,40 @@ def _build_role_profile(role_json: dict[str, Any]) -> str:
     habits = role_json.get("speaking_habits")
     if not isinstance(habits, list):
         habits = []
+    role_context = pick("domain_context") or pick("business_background")
+    constraints_text = "; ".join(str(x) for x in constraints) if constraints else ""
+    criteria_text = "; ".join(str(x) for x in criteria) if criteria else ""
+    habits_text = "; ".join(str(x) for x in habits) if habits else ""
     return (
-        f"- 角色名: {pick('role_name')}\n"
-        f"- 身份: {pick('identity')}\n"
-        f"- 业务背景: {pick('business_background')}\n"
-        f"- 沟通风格: {pick('communication_style')}\n"
-        f"- 当前目标: {pick('current_goal')}\n"
-        f"- 约束条件: {'；'.join(str(x) for x in constraints) if constraints else ''}\n"
-        f"- 成功标准: {'；'.join(str(x) for x in criteria) if criteria else ''}\n"
-        f"- 表达习惯: {'；'.join(str(x) for x in habits) if habits else ''}"
+        f"- role_name: {pick('role_name')}\n"
+        f"- identity: {pick('identity')}\n"
+        f"- context: {role_context}\n"
+        f"- communication_style: {pick('communication_style')}\n"
+        f"- current_goal: {pick('current_goal')}\n"
+        f"- constraints: {constraints_text}\n"
+        f"- success_criteria: {criteria_text}\n"
+        f"- speaking_habits: {habits_text}"
     )
 
 
 def _parse_generated_role(content: str) -> GeneratedRole:
     parsed = _safe_json_loads(content)
     if isinstance(parsed, dict):
-        role_name = str(parsed.get("role_name") or parsed.get("name") or "").strip() or f"随机客户-{uuid.uuid4().hex[:6]}"
+        role_name = str(parsed.get("role_name") or parsed.get("name") or "").strip() or f"random-user-{uuid.uuid4().hex[:6]}"
         parsed["role_name"] = role_name
         role_profile = _build_role_profile(parsed)
         return GeneratedRole(role_name=role_name, role_profile=role_profile, role_json=parsed)
 
-    fallback_name = f"随机客户-{uuid.uuid4().hex[:6]}"
+    fallback_name = f"random-user-{uuid.uuid4().hex[:6]}"
     fallback_json = {
         "role_name": fallback_name,
-        "identity": "中小企业主",
-        "business_background": "近期希望提升线上获客效率",
-        "communication_style": "直接务实",
-        "current_goal": "尽快得到可执行的文案与图片素材",
-        "constraints": ["预算有限", "时间紧"],
-        "success_criteria": ["能直接上线", "可衡量效果"],
-        "speaking_habits": ["关注落地性", "会追问风险点"],
+        "identity": "SMB operator",
+        "domain_context": "Need practical marketing outputs in a short timeline",
+        "communication_style": "direct and pragmatic",
+        "current_goal": "Get usable copy and image assets quickly",
+        "constraints": ["limited budget", "tight deadline"],
+        "success_criteria": ["ready to publish", "measurable outcome"],
+        "speaking_habits": ["focus on execution", "ask for risk tradeoffs"],
     }
     return GeneratedRole(
         role_name=fallback_name,
@@ -407,36 +416,51 @@ def generate_user_turn_with_simulator(
     current_focus = capability_focus_for_turn(sim_cfg.capability_mode, turn_idx)
 
     user_prompt = (
-        f"当前请生成第 {turn_idx} 轮用户输入。\n\n"
-        f"场景要求：\n{scenario_prompt}\n\n"
-        f"本轮能力焦点：{current_focus}\n"
-        "可选值说明：copywriting / image_generation / either。\n\n"
-        f"当前扮演角色：\n{role.role_profile}\n\n"
-        f"最近多轮记录：\n{history_text}\n\n"
-        f"Workspace snapshot visible to user:\n{workspace_text}\n\n"
-        f"上一轮助手回复：\n{latest_assistant}\n\n"
-        "输出要求：\n"
-        "1. 只输出 JSON。\n"
-        "2. JSON 格式：{\"user_text\":\"...\",\"stop\":false,\"reason\":\"\"}\n"
-        "3. user_text 里不要出现工具调用、JSON、XML。\n"
-        "4. 如果应该结束，stop=true 且 user_text 置空。"
+        f"Current turn: please generate user input for turn {turn_idx}.\n\n"
+        f"Scenario constraints:\n{scenario_prompt}\n\n"
+        f"Current capability focus: {current_focus}\n"
+        "Allowed values: copywriting / image_generation / either.\n\n"
+        f"Current role profile:\n{role.role_profile}\n\n"
+        f"Recent dialogue history:\n{history_text}\n\n"
+        f"User-visible workspace snapshot:\n{workspace_text}\n\n"
+        f"Latest assistant reply:\n{latest_assistant}\n\n"
+        "Decision rules:\n"
+        "1. If workspace snapshot already has turn_touched_preview / turn_text_artifacts / turn_image_artifacts, treat it as delivered.\n"
+        "2. When delivery exists, continue with revision/refinement/next-step requests; do not claim \"nothing delivered\".\n"
+        "3. Only report missing delivery when snapshot is empty or truly lacks delivery signals.\n\n"
+        "Output rules:\n"
+        "1. Output JSON only.\n"
+        '2. JSON schema: {"user_text":"...","stop":false,"reason":""}\n'
+        "3. Do not include tool payload, JSON/XML literals, or prompt-engineering terms in user_text.\n"
+        "4. If conversation should end, set stop=true and leave user_text empty.\n"
     )
+    provider_context_unsupported = bool(sim_state.provider_context_unsupported)
+    has_prev = bool(sim_state.previous_response_id)
+    use_provider_context = (sim_cfg.mode == "provider_context") and has_prev and (not provider_context_unsupported)
+
     # Primary attempt follows configured context mode.
-    retry_prev_ids: list[str] = [sim_state.previous_response_id]
+    retry_prev_ids: list[str] = [sim_state.previous_response_id] if use_provider_context else [""]
     # Fallback: when provider_context chain gets unstable, retry with stateless call.
-    if sim_cfg.mode == "provider_context" and sim_state.previous_response_id:
+    if use_provider_context:
         retry_prev_ids.append("")
 
     latest_content = ""
     latest_prev_id = sim_state.previous_response_id
     for prev_id in retry_prev_ids:
-        content, payload = _call_user_sim_model(
-            sim_cfg=sim_cfg,
-            system_prompt=sim_cfg.system_prompt,
-            user_prompt=user_prompt,
-            previous_response_id=prev_id,
-            temperature=sim_cfg.user_temperature,
-        )
+        try:
+            content, payload = _call_user_sim_model(
+                sim_cfg=sim_cfg,
+                system_prompt=sim_cfg.system_prompt,
+                user_prompt=user_prompt,
+                previous_response_id=prev_id,
+                temperature=sim_cfg.user_temperature,
+            )
+        except Exception as exc:
+            lowered = str(exc).lower()
+            if prev_id and (("previous_response_id" in lowered and "supported" in lowered) or "client_error_400" in lowered):
+                provider_context_unsupported = True
+            latest_content = f"{exc.__class__.__name__}:{exc}"
+            continue
 
         user_text, stop, _ = _parse_user_sim_output(content)
         next_prev_id = ""
@@ -444,9 +468,13 @@ def generate_user_turn_with_simulator(
             next_prev_id = str(payload.get("id") or "").strip()
 
         if user_text or stop:
-            return user_text, stop, UserSimulatorState(previous_response_id=next_prev_id or latest_prev_id)
+            return user_text, stop, UserSimulatorState(
+                previous_response_id=next_prev_id or latest_prev_id,
+                provider_context_unsupported=provider_context_unsupported,
+            )
 
         latest_content = content
         latest_prev_id = next_prev_id or latest_prev_id
 
     raise RuntimeError(f"user_simulator produced empty output: {latest_content}")
+

@@ -1,0 +1,53 @@
+{
+  "version": "1.0",
+  "description": "Compression retention contract probes for must/should/may tiers.",
+  "target": "advoo",
+  "profiles": [
+    {
+      "probe_id": "compression_contract_theme_visual_cta_v1",
+      "retention_tier": "mixed_contract",
+      "memory_channel_expectation": "session_only",
+      "anchor": {
+        "anchor_name": "campaign_theme_visual_cta",
+        "points": [
+          {
+            "point_id": "p1",
+            "text": "活动主题偏好（例如：春夜开跑周）",
+            "tier": "must_keep"
+          },
+          {
+            "point_id": "p2",
+            "text": "视觉风格偏好（例如：霓虹绿+黑底街头感）",
+            "tier": "should_keep"
+          },
+          {
+            "point_id": "p3",
+            "text": "一句引导语口吻偏好",
+            "tier": "may_drop"
+          }
+        ]
+      },
+      "plant_text_template": "先记一下我这轮活动偏好：{{P1}}；视觉：{{P2}}；结尾口吻：{{P3}}。",
+      "probe_text_templates": [
+        "按我最早那版偏好，给一句口语化方向。",
+        "别太正式，按之前那种感觉再来一版。",
+        "你还记得我开头说的那套风格吗，先短答。"
+      ],
+      "judge_rubric": {
+        "required_state": "remembered_or_partial",
+        "forget_state": "forgotten",
+        "cause_required_for_failure": "compression_related",
+        "false_alarm_causes": [
+          "task_switch",
+          "instruction_override",
+          "insufficient_evidence"
+        ]
+      },
+      "failure_policy": {
+        "must_keep_post_compaction_max_fail_rate": 0.0,
+        "should_keep_post_compaction_max_fail_rate": 0.2,
+        "may_drop_used_for_gating": false
+      }
+    }
+  ]
+}

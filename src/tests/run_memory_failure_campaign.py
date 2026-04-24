@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import statistics
 import sys
 import uuid
@@ -28,12 +29,14 @@ from tests.run_5turn_session_test import (  # noqa: E402
     load_config,
     normalize_authz,
     now_stamp,
+    preflight_cleanup_test_processes,
     resolve_config_path,
     resolve_dotai_base_url,
 )
 from tests.run_memory_compression_failure_scan import (  # noqa: E402
     ScanArgs as BaseScanArgs,
     SharedRuntime,
+    LLMEndpointConfig,
     _build_result_markdown,
     _build_stats,
     _estimate_focus_turn,
@@ -52,6 +55,7 @@ class CampaignArgs:
     hard_max_turns: int
     probe_interval: int
     focus_window: int
+    skip_preflight_cleanup: bool = False
 
 
 def parse_args(argv: list[str]) -> CampaignArgs:
@@ -66,6 +70,11 @@ def parse_args(argv: list[str]) -> CampaignArgs:
     parser.add_argument("--hard-max-turns", type=int, default=0, help="Safety cap per session; 0=no cap.")
     parser.add_argument("--probe-interval", type=int, default=3, help="Probe interval for coarse mode.")
     parser.add_argument("--focus-window", type=int, default=3, help="Probe focus window around estimate.")
+    parser.add_argument(
+        "--skip-preflight-cleanup",
+        action="store_true",
+        help="Skip pre-run cleanup for stale auto_test test processes.",
+    )
     p = parser.parse_args(argv)
     return CampaignArgs(
         env=str(p.env or "").strip(),
@@ -76,6 +85,7 @@ def parse_args(argv: list[str]) -> CampaignArgs:
         hard_max_turns=max(0, min(5000, int(p.hard_max_turns))),
         probe_interval=max(1, min(60, int(p.probe_interval))),
         focus_window=max(1, min(60, int(p.focus_window))),
+        skip_preflight_cleanup=bool(p.skip_preflight_cleanup),
     )
 
 
@@ -128,6 +138,7 @@ def _run_batch(
     create_settings_json: str | None,
     user_sim_cfg: Any,
     dotai_base_url: str,
+    probe_llm_cfg: LLMEndpointConfig,
     focus_turn: int | None,
     session_count: int,
     parallel_sessions: int,
@@ -159,6 +170,7 @@ def _run_batch(
         dotai_base_url=dotai_base_url,
         sessions_root=sessions_root,
         args=base_args,
+        probe_llm_cfg=probe_llm_cfg,
     )
 
     session_payloads: list[dict[str, Any]] = []
@@ -180,7 +192,7 @@ def _run_batch(
         if isinstance(v, int):
             values_effective.append(v)
 
-    chart_title = f"{batch_name} distribution (effective turn = raw - 2)"
+    chart_title = f"{batch_name} distribution (effective turn = raw)"
     chart_meta = _write_distribution_svg(
         aggregate_root / "failure_turn_distribution.svg",
         values_effective,
@@ -264,6 +276,16 @@ def _write_campaign_summary(campaign_root: Path, payload: dict[str, Any]) -> Non
 
 def main() -> int:
     args = parse_args(sys.argv[1:])
+    skip_cleanup_env = str(os.getenv("AUTO_TEST_SKIP_PREFLIGHT_CLEANUP", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if args.skip_preflight_cleanup or skip_cleanup_env:
+        print("[INFO] preflight_cleanup skipped by flag or env")
+    else:
+        preflight_cleanup_test_processes("run_memory_failure_campaign")
     cfg_path = resolve_config_path()
     cfg = load_config(cfg_path, args.env)
     applied_proxy = apply_proxy_from_config(cfg)
@@ -287,6 +309,14 @@ def main() -> int:
     user_sim_cfg = build_user_simulator_config(cfg, llm_eval_cfg)
     if (not user_sim_cfg.enabled) or (not user_sim_cfg.base_url) or (not user_sim_cfg.model) or (not user_sim_cfg.api_key):
         raise RuntimeError("user_simulator not configured: check enabled/base_url/model/api_key.")
+    probe_llm_cfg = LLMEndpointConfig(
+        base_url=str(user_sim_cfg.base_url or "").strip(),
+        model=str(user_sim_cfg.model or "").strip(),
+        api_key=str(user_sim_cfg.api_key or "").strip(),
+        timeout_sec=int(user_sim_cfg.timeout_sec),
+    )
+    if (not probe_llm_cfg.base_url) or (not probe_llm_cfg.model) or (not probe_llm_cfg.api_key):
+        raise RuntimeError("probe_llm config missing: base_url/model/api_key")
 
     print(f"[INFO] campaign_id={campaign_id}")
     print(f"[INFO] campaign_root={campaign_root.as_posix()}")
@@ -312,6 +342,7 @@ def main() -> int:
         create_settings_json=create_settings_json,
         user_sim_cfg=user_sim_cfg,
         dotai_base_url=dotai_base_url,
+        probe_llm_cfg=probe_llm_cfg,
         focus_turn=None,
         session_count=args.seed_sessions,
         parallel_sessions=args.parallel_sessions,
@@ -333,6 +364,7 @@ def main() -> int:
             create_settings_json=create_settings_json,
             user_sim_cfg=user_sim_cfg,
             dotai_base_url=dotai_base_url,
+            probe_llm_cfg=probe_llm_cfg,
             focus_turn=estimated_raw,
             session_count=args.focused_sessions,
             parallel_sessions=args.parallel_sessions,
@@ -355,7 +387,7 @@ def main() -> int:
     focused_chart_meta = _write_distribution_svg(
         campaign_root / "aggregate" / "focused_combined_distribution.svg",
         focused_values,
-        "Focused rounds combined distribution (effective turn = raw - 2)",
+        "Focused rounds combined distribution (effective turn = raw)",
     )
 
     campaign_summary = {
@@ -418,4 +450,3 @@ if __name__ == "__main__":
     except Exception as exc:
         print(f"[ERROR] {exc}", file=sys.stderr)
         raise
-

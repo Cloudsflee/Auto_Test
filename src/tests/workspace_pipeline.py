@@ -99,6 +99,60 @@ def _is_image_like_file(path: str) -> bool:
     return _workspace_path_ext(path) in IMAGE_EXTS
 
 
+def _to_compact_single_line(text: str, max_chars: int = 220) -> str:
+    raw = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(raw) <= max_chars:
+        return raw
+    return raw[: max_chars - 3] + "..."
+
+
+def _infer_image_hint_from_path(path: str) -> str:
+    try:
+        file_name = PurePosixPath(str(path or "")).name
+    except Exception:
+        file_name = str(path or "")
+    stem = file_name.rsplit(".", 1)[0]
+    tokens = [t for t in re.split(r"[_\-.]+", stem) if t]
+    filtered: list[str] = []
+    for tok in tokens:
+        if re.fullmatch(r"[0-9a-fA-F]{6,}", tok):
+            continue
+        if re.fullmatch(r"\d{4,}", tok):
+            continue
+        filtered.append(tok)
+    if not filtered:
+        return "generated image"
+    return " ".join(filtered[:8])
+
+
+def _normalize_event_text_by_path(raw: dict[str, str] | None) -> dict[str, str]:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, value in raw.items():
+        p = str(key or "").strip()
+        if not _looks_like_workspace_file(p):
+            continue
+        if not isinstance(value, str):
+            continue
+        out[p] = value
+    return out
+
+
+def _normalize_event_image_paths(raw: list[str] | None) -> list[str]:
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw:
+        p = str(item or "").strip()
+        if not _looks_like_workspace_file(p):
+            continue
+        if not _is_image_like_file(p):
+            continue
+        out.append(p)
+    return sorted(set(out))
+
+
 def _parse_files_api_items(payload: Any) -> list[dict[str, Any]]:
     if not isinstance(payload, dict):
         return []
@@ -183,6 +237,8 @@ def build_workspace_snapshot(
     headers: dict[str, str],
     session_id: str,
     event_paths: list[str],
+    event_text_by_path: dict[str, str] | None = None,
+    event_image_paths: list[str] | None = None,
 ) -> dict[str, Any]:
     api_paths, api_error = _list_workspace_paths_from_files_api(base_url, headers, session_id)
     merged_paths = sorted(set(api_paths) | set(event_paths))
@@ -190,6 +246,38 @@ def build_workspace_snapshot(
     file_paths = [p for p in merged_paths if _looks_like_workspace_file(p)]
     md_files = [p for p in file_paths if _is_markdown_like_file(p)]
     image_files = [p for p in file_paths if _is_image_like_file(p)]
+    event_file_paths = [p for p in event_paths if _looks_like_workspace_file(p)]
+    event_md_files = [p for p in event_file_paths if _is_markdown_like_file(p)]
+    event_img_files = [p for p in event_file_paths if _is_image_like_file(p)]
+    normalized_text_by_path = _normalize_event_text_by_path(event_text_by_path)
+    normalized_event_images = _normalize_event_image_paths(event_image_paths)
+
+    recent_image_files = sorted(set(event_img_files) | set(normalized_event_images))
+    recent_md_files = sorted(set(event_md_files) | set(normalized_text_by_path.keys()))
+    recent_touched_paths = sorted(
+        set(event_file_paths) | set(normalized_text_by_path.keys()) | set(recent_image_files)
+    )
+
+    text_artifacts: list[dict[str, Any]] = []
+    for path in sorted(normalized_text_by_path.keys())[:12]:
+        text = normalized_text_by_path[path]
+        text_artifacts.append(
+            {
+                "path": path,
+                "chars": len(text),
+                "lines": max(1, text.count("\n") + 1),
+                "excerpt": _to_compact_single_line(text, max_chars=220),
+            }
+        )
+
+    image_artifacts: list[dict[str, Any]] = []
+    for path in recent_image_files[:12]:
+        image_artifacts.append(
+            {
+                "path": path,
+                "hint": _infer_image_hint_from_path(path),
+            }
+        )
 
     source = "none"
     if api_paths and event_paths:
@@ -205,10 +293,21 @@ def build_workspace_snapshot(
         "all_paths": merged_paths[:200],
         "md_files": md_files[:80],
         "image_files": image_files[:80],
+        "recent_touched_paths": recent_touched_paths[:80],
+        "recent_md_files": recent_md_files[:40],
+        "recent_image_files": recent_image_files[:40],
+        "recent_artifacts": {
+            "text_files": text_artifacts,
+            "image_files": image_artifacts,
+        },
         "counts": {
             "all_paths": len(merged_paths),
             "md_files": len(md_files),
             "image_files": len(image_files),
+            "recent_touched_paths": len(recent_touched_paths),
+            "recent_md_files": len(recent_md_files),
+            "recent_image_files": len(recent_image_files),
+            "recent_text_artifacts": len(text_artifacts),
         },
     }
 
@@ -228,13 +327,46 @@ def render_workspace_snapshot_for_user_sim(snapshot: dict[str, Any] | None) -> s
     all_paths = snapshot.get("all_paths")
     if not isinstance(all_paths, list):
         all_paths = []
+    recent_touched_paths = snapshot.get("recent_touched_paths")
+    if not isinstance(recent_touched_paths, list):
+        recent_touched_paths = []
+    recent_artifacts = snapshot.get("recent_artifacts")
+    if not isinstance(recent_artifacts, dict):
+        recent_artifacts = {}
+    text_artifacts = recent_artifacts.get("text_files")
+    if not isinstance(text_artifacts, list):
+        text_artifacts = []
+    image_artifacts = recent_artifacts.get("image_files")
+    if not isinstance(image_artifacts, list):
+        image_artifacts = []
 
     lines = [
         f"source={snapshot.get('source') or 'unknown'}",
         f"total_paths={counts.get('all_paths', len(all_paths))}",
         f"md_files={counts.get('md_files', len(md_files))}",
         f"image_files={counts.get('image_files', len(image_files))}",
+        f"turn_touched_paths={counts.get('recent_touched_paths', len(recent_touched_paths))}",
     ]
+    if recent_touched_paths:
+        lines.append("turn_touched_preview:")
+        lines.extend(f"- {p}" for p in recent_touched_paths[:12])
+    if text_artifacts:
+        lines.append("turn_text_artifacts:")
+        for item in text_artifacts[:8]:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "").strip()
+            chars = item.get("chars")
+            excerpt = _to_compact_single_line(str(item.get("excerpt") or ""), max_chars=180)
+            lines.append(f"- {path} | chars={chars} | excerpt={excerpt}")
+    if image_artifacts:
+        lines.append("turn_image_artifacts:")
+        for item in image_artifacts[:8]:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "").strip()
+            hint = _to_compact_single_line(str(item.get("hint") or ""), max_chars=120)
+            lines.append(f"- {path} | hint={hint}")
     if md_files:
         lines.append("md_preview:")
         lines.extend(f"- {p}" for p in md_files[:12])
