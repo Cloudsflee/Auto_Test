@@ -123,7 +123,7 @@
       "target_name": "目标助手名称，对应 prompts/targets/<target_name>。",
       "max_turns": "模拟轮数上限。",
       "capability_mode": "能力考核模式（会影响 profile 路由）。",
-      "first_user_message": "首轮用户开场语（不再尝试清空共享记忆文件）。"
+      "first_user_message": "首轮用户开场语（每个 session 第 1 轮默认使用该文案）。"
     },
     "enabled": true,
     "mode": "provider_context",
@@ -136,7 +136,7 @@
     "capability_mode": "alternating",
     "user_temperature": 0.9,
     "role_temperature": 1.0,
-    "first_user_message": "我这边有个需求，先给我一个初版方向，我再告诉你怎么调整。",
+    "first_user_message": "重置两个记忆文件为初始模板，方便我开启新的项目，ok？",
     "system_prompt_file": "framework/simulator/system/user_simulator_system.prompt",
     "role_system_prompt_file": "framework/simulator/role_generation/role_system.prompt",
     "role_user_prompt_file": "framework/simulator/role_generation/role_user.prompt"

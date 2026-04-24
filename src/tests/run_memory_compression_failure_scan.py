@@ -245,7 +245,7 @@ def parse_args(argv: list[str]) -> ScanArgs:
     parser.add_argument(
         "--skip-preflight-cleanup",
         action="store_true",
-        help="Skip pre-run cleanup for stale auto_test test processes.",
+        help="Deprecated no-op. Preflight process cleanup is disabled.",
     )
     parsed = parser.parse_args(argv)
     return ScanArgs(
@@ -2216,26 +2216,7 @@ def _run_single_session(shared: SharedRuntime, session_idx: int, focus_turn: int
             probe_question_meta: dict[str, Any] = {}
             if turn_idx == 1:
                 turn_kind = "session_start"
-                try:
-                    sim_text, should_stop, sim_state = generate_user_turn_with_simulator(
-                        sim_cfg=shared.user_sim_cfg,
-                        sim_state=sim_state,
-                        results=turn_results,
-                        role=generated_role,
-                        turn_idx=turn_idx,
-                        workspace_snapshot=latest_workspace_snapshot,
-                    )
-                    user_text = str(sim_text or "").strip()
-                    if should_stop or not user_text:
-                        user_text = DEFAULT_FIRST_USER_TEXT
-                        turn_kind = "session_start_fallback"
-                except Exception as exc:
-                    user_text = DEFAULT_FIRST_USER_TEXT
-                    turn_kind = "session_start_fallback"
-                    print(
-                        "[WARN] first_turn_simulator_fallback "
-                        f"session={session_idx} reason={exc.__class__.__name__}"
-                    )
+                user_text = str(shared.user_sim_cfg.first_user_message or "").strip() or DEFAULT_FIRST_USER_TEXT
             elif turn_idx == 2:
                 user_text = str(anchor.get("plant_message") or "")
                 turn_kind = "plant_probe"
@@ -2720,9 +2701,8 @@ def _run_single_session_with_quick_self_check(
 def main() -> int:
     args = parse_args(sys.argv[1:])
     if args.skip_preflight_cleanup or _as_bool(os.getenv("AUTO_TEST_SKIP_PREFLIGHT_CLEANUP"), False):
-        print("[INFO] preflight_cleanup skipped by flag or env")
-    else:
-        preflight_cleanup_test_processes("run_memory_compression_failure_scan")
+        print("[INFO] preflight_cleanup flag/env detected (deprecated no-op)")
+    preflight_cleanup_test_processes("run_memory_compression_failure_scan")
     os.environ["AUTO_TEST_TURN_TIMEOUT_SEC"] = str(args.turn_timeout_sec)
     cfg_path = resolve_config_path()
     cfg = load_config(cfg_path, args.env)

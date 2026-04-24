@@ -4,8 +4,8 @@
 
 ## 运行前置行为
 
-- 所有主入口脚本在正式执行前会自动清理历史遗留的 `auto_test/src/tests` 相关后台进程（例如上一次未退出的 `python/powershell` 测试进程）。
-- 如需临时跳过，可使用 CLI 参数 `--skip-preflight-cleanup`，或设置环境变量 `AUTO_TEST_SKIP_PREFLIGHT_CLEANUP=true`。
+- 所有主入口脚本已禁用“系统进程查询与清理”逻辑，不再自动枚举或结束本机进程。
+- CLI 参数 `--skip-preflight-cleanup` 与环境变量 `AUTO_TEST_SKIP_PREFLIGHT_CLEANUP` 仅为兼容保留，当前不生效。
 
 ## 断流兜底默认值
 
@@ -18,7 +18,7 @@
 
 - `run_5turn_session_test.py`
   - 通用多轮会话自动测试入口（`create_session -> execute_session -> SSE 解析 -> 结果落盘`）。
-  - 默认首轮也由角色模拟 LLM 生成，`first_user_message` 仅作为首轮失败兜底。
+  - 默认首轮直接使用 `first_user_message` 作为 session 开场语，从第 2 轮开始由角色模拟 LLM 生成。
   - 支持用户模拟器、整体评估（LLM）、探针评估、workspace 导出。
 - `run_memory_compression_failure_scan.py`
   - 记忆压缩失效轮次扫描脚本。
@@ -48,8 +48,6 @@ python auto_test/src/tests/run_memory_compression_failure_scan.py --env test --s
 # 带硬上限
 python auto_test/src/tests/run_memory_compression_failure_scan.py --env test --sessions 10 --hard-max-turns 40
 
-# 临时跳过启动前清理
-python auto_test/src/tests/run_5turn_session_test.py --env test --max-turns 10 --skip-preflight-cleanup
 ```
 
 ## 结果目录（失效扫描）

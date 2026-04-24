@@ -6,7 +6,6 @@ import json
 import os
 import random
 import re
-import subprocess
 import sys
 import time
 import uuid
@@ -86,9 +85,9 @@ class ProbeEvalConfig:
     llm_weight: float
 
 
-DEFAULT_FIRST_USER_TEXT = "我这边有个需求，先给我一个初版方向，我再告诉你怎么调整。"
+DEFAULT_FIRST_USER_TEXT = "重置两个记忆文件为初始模板，方便我开启新的项目，ok？"
 # Backward-compatible placeholder key retained for existing prompt templates.
-# It now maps to first-turn opener text (not reset-memory instruction).
+# It now maps to first-turn opener text.
 REQUIRED_NOTEBOOK_CLEAR_TEXT = DEFAULT_FIRST_USER_TEXT
 PROMPTS_DIR = AUTO_TEST_DIR / "prompts"
 FRAMEWORK_PROMPTS_DIR = PROMPTS_DIR / "framework"
@@ -105,13 +104,6 @@ DEFAULT_SIM_CALLBACK_MAX_ROUNDS = 8
 COMPACTION_TOOL_NAMES = {"memory_file_compaction", "summary_compaction"}
 TRANSIENT_HTTP_STATUS_CODES = {429, 502, 503, 504}
 TERMINAL_EVENT_TYPES = {"RUN_END", "RUN_ERROR"}
-TEST_ENTRY_SCRIPT_MARKERS = (
-    "/auto_test/src/tests/run_5turn_session_test.py",
-    "/auto_test/src/tests/run_memory_compression_failure_scan.py",
-    "/auto_test/src/tests/run_memory_failure_campaign.py",
-    "/auto_test/src/tests/postprocess_memory_failure_cn_report.py",
-)
-TEST_PROCESS_NAME_HINTS = ("python", "powershell", "pwsh", "cmd")
 
 
 def _pick_text_value(text: str, key: str) -> str:
@@ -371,165 +363,23 @@ def parse_runtime_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--skip-preflight-cleanup",
         action="store_true",
-        help="Skip pre-run cleanup for stale auto_test test processes.",
+        help="Deprecated no-op. Preflight process cleanup is disabled.",
     )
     return parser.parse_args(argv)
 
 
-def _normalize_cmdline_for_match(text: Any) -> str:
-    return str(text or "").strip().lower().replace("\\", "/")
-
-
-def _list_windows_processes_for_cleanup() -> list[dict[str, Any]]:
-    ps_cmd = (
-        "Get-CimInstance Win32_Process | "
-        "Select-Object ProcessId,ParentProcessId,Name,CommandLine | "
-        "ConvertTo-Json -Depth 3"
-    )
-    try:
-        cp = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps_cmd],
-            check=False,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="ignore",
-            timeout=25,
-        )
-    except Exception:
-        return []
-    if cp.returncode != 0:
-        return []
-    payload = _safe_json_loads((cp.stdout or "").strip())
-    if isinstance(payload, dict):
-        payload = [payload]
-    if not isinstance(payload, list):
-        return []
-    rows: list[dict[str, Any]] = []
-    for row in payload:
-        if isinstance(row, dict):
-            rows.append(row)
-    return rows
-
-
-def _collect_parent_chain(pid_to_parent: dict[int, int], start_pid: int) -> set[int]:
-    chain: set[int] = set()
-    cursor = int(start_pid)
-    for _ in range(64):
-        if cursor <= 0 or cursor in chain:
-            break
-        chain.add(cursor)
-        cursor = int(pid_to_parent.get(cursor, 0))
-    return chain
-
-
 def preflight_cleanup_test_processes(caller: str) -> dict[str, Any]:
-    if os.name != "nt":
-        print(f"[INFO] preflight_cleanup skipped: unsupported_os={os.name}")
-        return {
-            "caller": caller,
-            "supported": False,
-            "candidates": 0,
-            "killed": 0,
-            "failed": [],
-        }
-
-    rows = _list_windows_processes_for_cleanup()
-    if not rows:
-        print("[WARN] preflight_cleanup skipped: cannot enumerate processes")
-        return {
-            "caller": caller,
-            "supported": True,
-            "candidates": 0,
-            "killed": 0,
-            "failed": [],
-        }
-
-    pid_to_parent: dict[int, int] = {}
-    for row in rows:
-        pid = _coerce_int(row.get("ProcessId"))
-        if pid <= 0:
-            continue
-        pid_to_parent[pid] = _coerce_int(row.get("ParentProcessId"))
-
-    protect_pids = _collect_parent_chain(pid_to_parent, os.getpid())
-    protect_pids.add(os.getppid())
-
-    candidates: dict[int, dict[str, str]] = {}
-    for row in rows:
-        pid = _coerce_int(row.get("ProcessId"))
-        if pid <= 0 or pid in protect_pids:
-            continue
-        proc_name = str(row.get("Name") or "").strip()
-        proc_name_norm = proc_name.lower()
-        if not any(hint in proc_name_norm for hint in TEST_PROCESS_NAME_HINTS):
-            continue
-        cmdline = str(row.get("CommandLine") or "")
-        cmd_norm = _normalize_cmdline_for_match(cmdline)
-        if not cmd_norm:
-            continue
-
-        has_known_entry = any(marker in cmd_norm for marker in TEST_ENTRY_SCRIPT_MARKERS)
-        is_auto_test_runner = "/auto_test/src/tests/" in cmd_norm and ("run_" in cmd_norm or "pytest" in cmd_norm)
-        if not (has_known_entry or is_auto_test_runner):
-            continue
-
-        candidates[pid] = {
-            "name": proc_name,
-            "cmdline": cmdline.strip(),
-        }
-
-    killed = 0
-    failed: list[dict[str, Any]] = []
-    for pid, meta in sorted(candidates.items(), key=lambda item: item[0]):
-        try:
-            cp = subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                check=False,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="ignore",
-                timeout=20,
-            )
-        except Exception as exc:
-            failed.append(
-                {
-                    "pid": pid,
-                    "name": meta.get("name") or "",
-                    "error": str(exc),
-                }
-            )
-            continue
-
-        if cp.returncode == 0:
-            killed += 1
-            print(f"[INFO] preflight_cleanup killed pid={pid} name={meta.get('name')}")
-        else:
-            failed.append(
-                {
-                    "pid": pid,
-                    "name": meta.get("name") or "",
-                    "stderr": (cp.stderr or "").strip(),
-                    "stdout": (cp.stdout or "").strip(),
-                }
-            )
-
     print(
-        "[INFO] preflight_cleanup "
-        f"caller={caller} candidates={len(candidates)} killed={killed} failed={len(failed)}"
+        "[INFO] preflight_cleanup disabled "
+        f"caller={caller} reason=system_process_query_removed"
     )
-    for item in failed[:5]:
-        print(
-            "[WARN] preflight_cleanup_failed "
-            f"pid={item.get('pid')} name={item.get('name')} reason={(item.get('stderr') or item.get('error') or item.get('stdout') or '(unknown)')}"
-        )
     return {
         "caller": caller,
-        "supported": True,
-        "candidates": len(candidates),
-        "killed": killed,
-        "failed": failed,
+        "supported": False,
+        "disabled": True,
+        "candidates": 0,
+        "killed": 0,
+        "failed": [],
     }
 
 
@@ -2541,9 +2391,8 @@ def write_dialogue_md(path: Path, results: list[dict[str, Any]]) -> None:
 def main() -> int:
     args = parse_runtime_args(sys.argv[1:])
     if args.skip_preflight_cleanup or _env_bool("AUTO_TEST_SKIP_PREFLIGHT_CLEANUP", False):
-        print("[INFO] preflight_cleanup skipped by flag or env")
-    else:
-        preflight_cleanup_test_processes("run_5turn_session_test")
+        print("[INFO] preflight_cleanup flag/env detected (deprecated no-op)")
+    preflight_cleanup_test_processes("run_5turn_session_test")
     cfg_path = resolve_config_path()
     cfg = load_config(cfg_path, args.env)
     applied_proxy = apply_proxy_from_config(cfg)
@@ -2696,33 +2545,23 @@ def main() -> int:
         latest_workspace_snapshot: dict[str, Any] | None = None
 
         for idx in range(1, target_turns + 1):
-            try:
-                user_text, should_stop, sim_state = generate_user_turn_with_simulator(
-                    sim_cfg=user_sim_cfg,
-                    sim_state=sim_state,
-                    results=results,
-                    role=generated_role,
-                    turn_idx=idx,
-                    workspace_snapshot=latest_workspace_snapshot,
-                )
-                if should_stop:
-                    if idx == 1:
-                        user_text = user_sim_cfg.first_user_message
-                        print(
-                            "[WARN] user_simulator requested stop at first turn; "
-                            "fallback to configured first_user_message."
-                        )
-                    else:
+            if idx == 1:
+                user_text = user_sim_cfg.first_user_message
+                print("[INFO] turn=1 using configured first_user_message as session opener.")
+            else:
+                try:
+                    user_text, should_stop, sim_state = generate_user_turn_with_simulator(
+                        sim_cfg=user_sim_cfg,
+                        sim_state=sim_state,
+                        results=results,
+                        role=generated_role,
+                        turn_idx=idx,
+                        workspace_snapshot=latest_workspace_snapshot,
+                    )
+                    if should_stop:
                         print(f"[INFO] user_simulator requested stop at turn={idx}")
                         break
-            except Exception as exc:
-                if idx == 1:
-                    user_text = user_sim_cfg.first_user_message
-                    print(
-                        "[WARN] first turn generated by user_simulator failed; "
-                        f"fallback to configured first_user_message. reason={exc.__class__.__name__}"
-                    )
-                else:
+                except Exception as exc:
                     raise RuntimeError(f"user_simulator turn={idx} 鐢熸垚澶辫触: {exc}") from exc
 
             print(f"[INFO] turn={idx}")

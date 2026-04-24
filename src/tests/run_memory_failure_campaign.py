@@ -73,7 +73,7 @@ def parse_args(argv: list[str]) -> CampaignArgs:
     parser.add_argument(
         "--skip-preflight-cleanup",
         action="store_true",
-        help="Skip pre-run cleanup for stale auto_test test processes.",
+        help="Deprecated no-op. Preflight process cleanup is disabled.",
     )
     p = parser.parse_args(argv)
     return CampaignArgs(
@@ -283,9 +283,8 @@ def main() -> int:
         "on",
     }
     if args.skip_preflight_cleanup or skip_cleanup_env:
-        print("[INFO] preflight_cleanup skipped by flag or env")
-    else:
-        preflight_cleanup_test_processes("run_memory_failure_campaign")
+        print("[INFO] preflight_cleanup flag/env detected (deprecated no-op)")
+    preflight_cleanup_test_processes("run_memory_failure_campaign")
     cfg_path = resolve_config_path()
     cfg = load_config(cfg_path, args.env)
     applied_proxy = apply_proxy_from_config(cfg)
