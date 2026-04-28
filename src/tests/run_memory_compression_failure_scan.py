@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import math
 import os
 import random
 import re
@@ -66,6 +67,31 @@ from tests.user_simulator_engine import (  # noqa: E402
 )
 from tests.workspace_pipeline import export_workspace_view  # noqa: E402
 
+PROBE_KIND_MEMORY_POINT = "memory_point_probe"
+COMPACTION_TOOL_NAMES = {"memory_file_compaction", "summary_compaction"}
+COMPACTION_TOOL_SCOPE_MAP = {
+    "memory_file_compaction": "memory_file",
+    "summary_compaction": "session_summary",
+}
+COMPACTION_REQUIRED_SCOPES = ("memory_file", "session_summary")
+COMPACTION_SUCCESS_MARKERS = (
+    "压缩完成",
+    "壓縮完成",
+    "会话已压缩",
+    "會話已壓縮",
+    "session compacted",
+    "session compressed",
+    "compacted",
+)
+COMPACTION_SUCCESS_KEYWORDS = ("压缩", "壓縮", "compaction", "compacted", "compressed")
+COMPACTION_SUCCESS_CONTEXT_HINTS = ("会话", "會話", "session", "memory", "记忆", "記憶", "summary")
+COMPACTION_FAILURE_MARKERS = ("压缩失败", "壓縮失敗", "compaction failed", "SESSION_MEMORY_COMPACTION_FAILED")
+IMPORTANCE_TIERS = {"must_keep", "should_keep", "may_drop"}
+PROBE_MODES = {"hidden", "explicit"}
+PROBE_JUDGE_MODES = {"hybrid", "deterministic", "llm_only"}
+DEFAULT_POST_COMPACTION_PROBE_WINDOW_OFFSETS: tuple[int, ...] = (1, 2, 4, 6)
+SESSION_CHECKPOINT_FILE_NAME = "session_checkpoint.json"
+
 
 @dataclass
 class ScanArgs:
@@ -85,6 +111,23 @@ class ScanArgs:
     probe_similarity_threshold: float = 0.9
     probe_recent_window: int = 4
     probe_regen_max_attempts: int = 2
+    probe_post_compaction_window_offsets: tuple[int, ...] = DEFAULT_POST_COMPACTION_PROBE_WINDOW_OFFSETS
+    probe_max_density: float = 0.3
+    probe_judge_mode: str = "llm_only"
+    probe_llm_skip_fastpath: bool = True
+    probe_llm_verify_always: bool = True
+    spotcheck_enabled: bool = True
+    spotcheck_sample_rate: float = 0.25
+    spotcheck_min_samples: int = 12
+    spotcheck_max_samples: int = 120
+    spotcheck_seed: int = 20260426
+    turn_gateway_404_retry_max: int = 1
+    turn_gateway_404_retry_backoff_sec: float = 2.0
+    checkpoint_resume_enabled: bool = True
+    validity_min_verified_sessions: int = 8
+    validity_max_session_run_error_rate: float = 0.2
+    validity_min_compaction_completion_rate: float = 0.8
+    validity_ci_max_half_width: float = 0.15
     skip_preflight_cleanup: bool = False
 
 
@@ -101,19 +144,6 @@ class SharedRuntime:
     sessions_root: Path
     args: ScanArgs
     probe_llm_cfg: LLMEndpointConfig
-
-
-PROBE_KIND_MEMORY_POINT = "memory_point_probe"
-COMPACTION_TOOL_NAMES = {"memory_file_compaction", "summary_compaction"}
-COMPACTION_TOOL_SCOPE_MAP = {
-    "memory_file_compaction": "memory_file",
-    "summary_compaction": "session_summary",
-}
-COMPACTION_REQUIRED_SCOPES = ("memory_file", "session_summary")
-COMPACTION_SUCCESS_MARKERS = ("压缩完成", "壓縮完成", "compacted")
-COMPACTION_FAILURE_MARKERS = ("压缩失败", "壓縮失敗", "compaction failed", "SESSION_MEMORY_COMPACTION_FAILED")
-IMPORTANCE_TIERS = {"must_keep", "should_keep", "may_drop"}
-PROBE_MODES = {"hidden", "explicit"}
 
 
 def _as_bool(value: Any, default: bool = False) -> bool:
@@ -176,6 +206,37 @@ def _normalize_probe_mode(value: Any) -> str:
     if mode in PROBE_MODES:
         return mode
     return "hidden"
+
+
+def _normalize_probe_judge_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    if mode in PROBE_JUDGE_MODES:
+        return mode
+    return "hybrid"
+
+
+def _parse_probe_window_offsets(raw: Any) -> tuple[int, ...]:
+    if isinstance(raw, (list, tuple)):
+        tokens = [str(v or "").strip() for v in raw]
+    else:
+        tokens = [v.strip() for v in str(raw or "").split(",")]
+    offsets: list[int] = []
+    seen: set[int] = set()
+    for token in tokens:
+        if not token:
+            continue
+        try:
+            value = int(float(token))
+        except Exception:
+            continue
+        value = max(1, min(20, value))
+        if value in seen:
+            continue
+        seen.add(value)
+        offsets.append(value)
+    if not offsets:
+        return DEFAULT_POST_COMPACTION_PROBE_WINDOW_OFFSETS
+    return tuple(offsets)
 
 
 def parse_args(argv: list[str]) -> ScanArgs:
@@ -243,6 +304,129 @@ def parse_args(argv: list[str]) -> ScanArgs:
         help="Max re-generation attempts when candidate probe is rejected by cooldown/similarity guard.",
     )
     parser.add_argument(
+        "--probe-post-compaction-window",
+        type=str,
+        default="1,2,4,6",
+        help="Event-driven high-frequency probe offsets after first compaction signal, e.g. 1,2,4,6.",
+    )
+    parser.add_argument(
+        "--probe-max-density",
+        type=float,
+        default=0.3,
+        help="Max probe density (executed_probe_turns / turn_idx).",
+    )
+    parser.add_argument(
+        "--probe-judge-mode",
+        type=str,
+        default="llm_only",
+        choices=sorted(PROBE_JUDGE_MODES),
+        help="Probe judge mode: deterministic / hybrid / llm_only.",
+    )
+    parser.add_argument(
+        "--probe-llm-skip-fastpath",
+        dest="probe_llm_skip_fastpath",
+        action="store_true",
+        default=True,
+        help="When probe_judge_mode=hybrid, disable deterministic fastpath so more checks go through LLM.",
+    )
+    parser.add_argument(
+        "--no-probe-llm-skip-fastpath",
+        dest="probe_llm_skip_fastpath",
+        action="store_false",
+        help="Allow deterministic fastpath in hybrid mode.",
+    )
+    parser.add_argument(
+        "--probe-llm-verify-always",
+        dest="probe_llm_verify_always",
+        action="store_true",
+        default=True,
+        help="Always execute verify LLM stage for probe checks, even when suspect=false.",
+    )
+    parser.add_argument(
+        "--no-probe-llm-verify-always",
+        dest="probe_llm_verify_always",
+        action="store_false",
+        help="Only verify when suspect=true (legacy cost-saving behavior).",
+    )
+    parser.add_argument(
+        "--spotcheck-enabled",
+        dest="spotcheck_enabled",
+        action="store_true",
+        default=True,
+        help="Enable probe consistency spot-check rejudge.",
+    )
+    parser.add_argument(
+        "--no-spotcheck-enabled",
+        dest="spotcheck_enabled",
+        action="store_false",
+        help="Disable probe consistency spot-check rejudge.",
+    )
+    parser.add_argument(
+        "--spotcheck-sample-rate",
+        type=float,
+        default=0.25,
+        help="Spot-check sampling rate over all probe_check rows.",
+    )
+    parser.add_argument(
+        "--spotcheck-min-samples",
+        type=int,
+        default=12,
+        help="Minimum spot-check samples when candidates are sufficient.",
+    )
+    parser.add_argument(
+        "--spotcheck-max-samples",
+        type=int,
+        default=120,
+        help="Maximum spot-check samples per run.",
+    )
+    parser.add_argument(
+        "--spotcheck-seed",
+        type=int,
+        default=20260426,
+        help="Random seed for spot-check sampling.",
+    )
+    parser.add_argument(
+        "--turn-gateway-404-retry-max",
+        type=int,
+        default=1,
+        help="Max retry attempts for turn-level gateway chat/completions 404 run_error fallback.",
+    )
+    parser.add_argument(
+        "--turn-gateway-404-retry-backoff-sec",
+        type=float,
+        default=2.0,
+        help="Base backoff seconds for gateway 404 fallback retries (linear: base * attempt).",
+    )
+    parser.add_argument(
+        "--disable-checkpoint-resume",
+        action="store_true",
+        help="Disable turn-level session checkpoint resume.",
+    )
+    parser.add_argument(
+        "--validity-min-verified-sessions",
+        type=int,
+        default=8,
+        help="Minimum verified-compaction sessions required for statistically valid report.",
+    )
+    parser.add_argument(
+        "--validity-max-session-run-error-rate",
+        type=float,
+        default=0.2,
+        help="Maximum acceptable session run_error rate for statistically valid report.",
+    )
+    parser.add_argument(
+        "--validity-min-compaction-completion-rate",
+        type=float,
+        default=0.8,
+        help="Minimum compaction completion rate required for statistically valid report.",
+    )
+    parser.add_argument(
+        "--validity-ci-max-half-width",
+        type=float,
+        default=0.15,
+        help="Maximum Wilson CI half-width for key metrics in validity proof.",
+    )
+    parser.add_argument(
         "--skip-preflight-cleanup",
         action="store_true",
         help="Deprecated no-op. Preflight process cleanup is disabled.",
@@ -265,6 +449,23 @@ def parse_args(argv: list[str]) -> ScanArgs:
         probe_similarity_threshold=max(0.6, min(0.999, float(parsed.probe_similarity_threshold))),
         probe_recent_window=max(1, min(12, int(parsed.probe_recent_window))),
         probe_regen_max_attempts=max(0, min(8, int(parsed.probe_regen_max_attempts))),
+        probe_post_compaction_window_offsets=_parse_probe_window_offsets(parsed.probe_post_compaction_window),
+        probe_max_density=max(0.1, min(0.8, float(parsed.probe_max_density))),
+        probe_judge_mode=_normalize_probe_judge_mode(parsed.probe_judge_mode),
+        probe_llm_skip_fastpath=bool(parsed.probe_llm_skip_fastpath),
+        probe_llm_verify_always=bool(parsed.probe_llm_verify_always),
+        spotcheck_enabled=bool(parsed.spotcheck_enabled),
+        spotcheck_sample_rate=max(0.01, min(1.0, float(parsed.spotcheck_sample_rate))),
+        spotcheck_min_samples=max(1, min(2000, int(parsed.spotcheck_min_samples))),
+        spotcheck_max_samples=max(1, min(5000, int(parsed.spotcheck_max_samples))),
+        spotcheck_seed=max(0, int(parsed.spotcheck_seed)),
+        turn_gateway_404_retry_max=max(0, min(5, int(parsed.turn_gateway_404_retry_max))),
+        turn_gateway_404_retry_backoff_sec=max(0.0, min(30.0, float(parsed.turn_gateway_404_retry_backoff_sec))),
+        checkpoint_resume_enabled=not bool(parsed.disable_checkpoint_resume),
+        validity_min_verified_sessions=max(1, min(2000, int(parsed.validity_min_verified_sessions))),
+        validity_max_session_run_error_rate=max(0.0, min(1.0, float(parsed.validity_max_session_run_error_rate))),
+        validity_min_compaction_completion_rate=max(0.0, min(1.0, float(parsed.validity_min_compaction_completion_rate))),
+        validity_ci_max_half_width=max(0.01, min(0.5, float(parsed.validity_ci_max_half_width))),
         skip_preflight_cleanup=bool(parsed.skip_preflight_cleanup),
     )
 
@@ -293,6 +494,67 @@ def _should_probe_turn(turn_idx: int, coarse_interval: int, focus_turn: int | No
         return True
     after_interval = max(1, coarse_interval // 2)
     return (turn_idx - right) % after_interval == 0
+
+
+def _should_schedule_probe_turn(
+    *,
+    turn_idx: int,
+    coarse_interval: int,
+    focus_turn: int | None,
+    focus_window: int,
+    first_compaction_signal_turn: int | None,
+    post_compaction_window_offsets: tuple[int, ...],
+    executed_probe_turns: list[int],
+    max_probe_density: float,
+) -> tuple[bool, str]:
+    baseline = _should_probe_turn(turn_idx, coarse_interval, focus_turn, focus_window)
+    boosted = False
+    if isinstance(first_compaction_signal_turn, int) and first_compaction_signal_turn > 0:
+        boosted = any(turn_idx == first_compaction_signal_turn + offset for offset in post_compaction_window_offsets)
+    if not baseline and not boosted:
+        return False, "not_scheduled"
+
+    next_count = len(executed_probe_turns) + 1
+    density = next_count / max(1, turn_idx)
+    hard_cap = min(0.95, max(0.35, max_probe_density + 0.25))
+    if density > hard_cap:
+        return False, f"density_hard_cap:{round(density,4)}>{round(hard_cap,4)}"
+    if density > max_probe_density and not boosted:
+        return False, f"density_soft_cap:{round(density,4)}>{round(max_probe_density,4)}"
+
+    if baseline and boosted:
+        return True, "baseline+post_compaction_window"
+    if boosted:
+        return True, "post_compaction_window"
+    return True, "baseline"
+
+
+def _turn_has_compaction_signal(result: dict[str, Any]) -> bool:
+    if not isinstance(result, dict):
+        return False
+    assistant_text = str(result.get("assistant_text") or "")
+    if _looks_like_compaction_text(assistant_text):
+        return True
+    infer_reason = str(result.get("run_end_infer_reason") or "").strip().lower()
+    if infer_reason and ("compaction" in infer_reason or "压缩" in infer_reason):
+        return True
+    terminal_type = str(result.get("terminal_event_type") or "").strip().upper()
+    if terminal_type == "RUN_END" and _looks_like_compaction_text(str(result.get("run_error_before_terminal_reconcile") or "")):
+        return True
+    return False
+
+
+def _is_retryable_gateway_404_run_error(run_error: Any) -> bool:
+    text = str(run_error or "").strip().lower()
+    if not text:
+        return False
+    if ("404" not in text) or ("not found" not in text):
+        return False
+    if ("chat/completions" in text) and ("gateway" in text):
+        return True
+    if ("v1/chat/completions" in text) and ("model-gateway" in text):
+        return True
+    return False
 
 
 def _build_filler_prompt(session_idx: int, turn_idx: int, session_id: str) -> str:
@@ -430,6 +692,217 @@ def _generate_filler_user_turn(
         return _build_filler_prompt(session_idx, turn_idx, session_id), "simulator_error_fallback", next_state
 
 
+def _sim_state_to_dict(state: UserSimulatorState) -> dict[str, Any]:
+    return {
+        "previous_response_id": str(getattr(state, "previous_response_id", "") or "").strip(),
+        "provider_context_unsupported": bool(getattr(state, "provider_context_unsupported", False)),
+    }
+
+
+def _sim_state_from_dict(obj: Any) -> UserSimulatorState:
+    if not isinstance(obj, dict):
+        return UserSimulatorState(previous_response_id="")
+    return UserSimulatorState(
+        previous_response_id=str(obj.get("previous_response_id") or "").strip(),
+        provider_context_unsupported=_as_bool(obj.get("provider_context_unsupported"), False),
+    )
+
+
+def _generated_role_to_dict(role: GeneratedRole) -> dict[str, Any]:
+    return {
+        "role_name": str(role.role_name or "").strip(),
+        "role_profile": str(role.role_profile or "").strip(),
+        "role_json": role.role_json if isinstance(role.role_json, dict) else {},
+    }
+
+
+def _generated_role_from_dict(obj: Any) -> GeneratedRole | None:
+    if not isinstance(obj, dict):
+        return None
+    role_name = str(obj.get("role_name") or "").strip()
+    role_profile = str(obj.get("role_profile") or "").strip()
+    role_json = obj.get("role_json") if isinstance(obj.get("role_json"), dict) else {}
+    if not role_name:
+        return None
+    return GeneratedRole(role_name=role_name, role_profile=role_profile, role_json=role_json)
+
+
+def _read_json_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return obj if isinstance(obj, dict) else {}
+
+
+def _read_json_any_file(path: Path) -> Any:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _extract_keywords_for_deterministic_match(text: str, max_count: int = 8) -> list[str]:
+    tokens = re.findall(r"[a-z0-9\u4e00-\u9fff]{2,}", str(text or "").lower())
+    stop_words = {
+        "这个",
+        "那个",
+        "我们",
+        "你们",
+        "一下",
+        "继续",
+        "可以",
+        "然后",
+        "一个",
+        "一段",
+        "文案",
+        "图片",
+        "配图",
+        "方向",
+        "主题",
+    }
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        if token in stop_words:
+            continue
+        if token in seen:
+            continue
+        seen.add(token)
+        cleaned.append(token)
+    cleaned.sort(key=len, reverse=True)
+    return cleaned[:max_count]
+
+
+def _deterministic_probe_judge(
+    *,
+    anchor: dict[str, Any],
+    probe_question: str,
+    assistant_reply: str,
+    probe_tier: str,
+) -> dict[str, Any]:
+    reply = str(assistant_reply or "").strip()
+    reply_norm = _normalize_probe_text_for_similarity(reply)
+    tier = _normalize_importance_tier(probe_tier)
+    points = _extract_anchor_points_structured(anchor)
+    if not points:
+        return {
+            "judge_state": JUDGE_AMBIGUOUS,
+            "cause_hint": CAUSE_INSUFFICIENT_EVIDENCE,
+            "forgotten": False,
+            "confidence_0_1": 0.2,
+            "reason": "deterministic_anchor_points_missing",
+            "matched_points": [],
+            "missing_points": [],
+            "deterministic_applicable": False,
+        }
+
+    matched_points: list[str] = []
+    missing_points: list[str] = []
+    for point in points:
+        point_text = str(point.get("text") or "").strip()
+        if not point_text:
+            continue
+        similarity = _text_similarity_ratio(point_text, reply)
+        kws = _extract_keywords_for_deterministic_match(point_text)
+        hit_kw = any(kw in reply_norm for kw in kws if kw)
+        if similarity >= 0.45 or hit_kw:
+            matched_points.append(point_text)
+        else:
+            missing_points.append(point_text)
+
+    asks_recall = any(k in str(probe_question or "").lower() for k in ("沿用", "之前", "记得", "上次", "方向", "主题", "风格", "cta"))
+    has_compaction_ack_only = _looks_like_compaction_text(reply) and len(reply_norm) <= 28
+    if matched_points:
+        return {
+            "judge_state": JUDGE_REMEMBERED,
+            "cause_hint": "none",
+            "forgotten": False,
+            "confidence_0_1": 0.82,
+            "reason": f"deterministic_matched_points={len(matched_points)} tier={tier}",
+            "matched_points": matched_points,
+            "missing_points": missing_points,
+            "deterministic_applicable": True,
+        }
+    if has_compaction_ack_only:
+        return {
+            "judge_state": JUDGE_FORGOTTEN,
+            "cause_hint": CAUSE_UNKNOWN,
+            "forgotten": True,
+            "confidence_0_1": 0.78,
+            "reason": "deterministic_compaction_ack_only_without_anchor_points",
+            "matched_points": [],
+            "missing_points": missing_points,
+            "deterministic_applicable": True,
+        }
+    if asks_recall and reply_norm and len(reply_norm) >= 16:
+        return {
+            "judge_state": JUDGE_FORGOTTEN,
+            "cause_hint": CAUSE_INSTRUCTION_OVERRIDE,
+            "forgotten": True,
+            "confidence_0_1": 0.68,
+            "reason": "deterministic_recall_question_no_anchor_hit",
+            "matched_points": [],
+            "missing_points": missing_points,
+            "deterministic_applicable": True,
+        }
+    return {
+        "judge_state": JUDGE_AMBIGUOUS,
+        "cause_hint": CAUSE_INSUFFICIENT_EVIDENCE,
+        "forgotten": False,
+        "confidence_0_1": 0.45,
+        "reason": "deterministic_ambiguous_no_anchor_hit",
+        "matched_points": [],
+        "missing_points": missing_points,
+        "deterministic_applicable": True,
+    }
+
+
+def _build_judge_objects_from_deterministic(det: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any], bool]:
+    state = str(det.get("judge_state") or JUDGE_AMBIGUOUS).strip().lower()
+    confidence = max(0.0, min(1.0, _as_float(det.get("confidence_0_1"), 0.0)))
+    reason = str(det.get("reason") or "").strip()
+    matched_points = det.get("matched_points")
+    missing_points = det.get("missing_points")
+    if not isinstance(matched_points, list):
+        matched_points = []
+    if not isinstance(missing_points, list):
+        missing_points = []
+    cause = str(det.get("cause_hint") or "").strip().lower()
+    if not cause:
+        cause = CAUSE_UNKNOWN if state == JUDGE_FORGOTTEN else "none"
+    forgotten = state == JUDGE_FORGOTTEN or _as_bool(det.get("forgotten"), False)
+    suspect = {
+        "loss_suspected": forgotten,
+        "confidence_0_1": round(confidence, 4),
+        "remembered_points": [str(x) for x in matched_points],
+        "missing_points": [str(x) for x in missing_points],
+        "reason_short": reason or "deterministic_judge",
+        "source": "deterministic",
+        "raw": det,
+    }
+    verify = {
+        "judge_state": state if state in {JUDGE_REMEMBERED, JUDGE_AMBIGUOUS, JUDGE_FORGOTTEN} else JUDGE_AMBIGUOUS,
+        "cause_hint": cause,
+        "forgotten": bool(forgotten),
+        "confidence_0_1": round(confidence, 4),
+        "score_0_100": round(confidence * 100.0, 2),
+        "reason": reason or "deterministic_judge",
+        "evidence_refs": [],
+        "source": "deterministic",
+        "raw": det,
+    }
+    return suspect, verify, bool(forgotten)
+
+
 def _workspace_artifact_counts(payload: dict[str, Any]) -> tuple[int, int]:
     counts = payload.get("workspace_counts")
     if not isinstance(counts, dict):
@@ -463,6 +936,10 @@ def _looks_like_compaction_text(text: str) -> bool:
     for marker in COMPACTION_SUCCESS_MARKERS:
         if marker.lower() in raw:
             return True
+    keyword_hit = any(str(keyword).lower() in raw for keyword in COMPACTION_SUCCESS_KEYWORDS)
+    context_hit = any(str(hint).lower() in raw for hint in COMPACTION_SUCCESS_CONTEXT_HINTS)
+    if keyword_hit and context_hit:
+        return True
     return False
 
 
@@ -592,9 +1069,17 @@ def _detect_compaction_events(
 
         if event_type == "TEXT" and _looks_like_compaction_text(content):
             scope = "unknown"
-            if "会话" in content or "session" in content.lower():
+            content_lower = content.lower()
+            if ("会话" in content) or ("會話" in content) or ("session" in content_lower):
                 scope = "session_summary"
-            elif "文件" in content or "file" in content.lower() or "memory" in content.lower():
+            elif (
+                ("文件" in content)
+                or ("檔案" in content)
+                or ("记忆" in content)
+                or ("記憶" in content)
+                or ("file" in content_lower)
+                or ("memory" in content_lower)
+            ):
                 scope = "memory_file"
             key = (turn, scope, "text_done")
             if key not in seen:
@@ -917,27 +1402,52 @@ def _build_probe_timeline(
     anchor: dict[str, Any],
 ) -> list[dict[str, Any]]:
     anchor_points = _anchor_points_with_tier(anchor)
+    anchor_point_by_id: dict[str, dict[str, str]] = {}
+    default_point_by_tier: dict[str, dict[str, str]] = {}
+    for item in anchor_points:
+        point_id = str(item.get("point_id") or "").strip()
+        point_text = str(item.get("text") or "").strip()
+        point_tier = _normalize_importance_tier(item.get("retention_tier"))
+        if point_id:
+            anchor_point_by_id[point_id] = {"text": point_text, "retention_tier": point_tier}
+        if point_tier not in default_point_by_tier:
+            default_point_by_tier[point_tier] = {
+                "point_id": point_id,
+                "text": point_text,
+            }
     timeline: list[dict[str, Any]] = []
     for check in probe_checks:
         turn = int(check.get("turn") or 0)
         phase = _compaction_phase_for_turn(turn, first_compaction_done_turn)
         scored = _score_tier_from_check(check)
-        for ap in anchor_points:
-            timeline.append(
-                {
-                    "turn": turn,
-                    "kind": str(check.get("kind") or ""),
-                    "probe_question": str(check.get("probe_question") or ""),
-                    "retention_tier": str(ap.get("retention_tier") or "should_keep"),
-                    "anchor_point_id": str(ap.get("point_id") or ""),
-                    "anchor_point_text": str(ap.get("text") or ""),
-                    "judge_state": scored["judge_state"],
-                    "cause_hint": scored["cause_hint"],
-                    "compaction_phase": phase,
-                    "miss_confirmed": bool(check.get("miss_confirmed")),
-                    "verify_reason": str((check.get("verify_judge") or {}).get("reason") or ""),
-                }
-            )
+        retention_tier = _normalize_importance_tier(check.get("probe_tier"))
+        anchor_point_id = str(check.get("probe_anchor_point_id") or "").strip()
+        anchor_point_text = str(check.get("probe_anchor_point_text") or "").strip()
+        if not anchor_point_id:
+            tier_default = default_point_by_tier.get(retention_tier) or {}
+            anchor_point_id = str(tier_default.get("point_id") or "").strip()
+        if not anchor_point_text:
+            by_id = anchor_point_by_id.get(anchor_point_id) if anchor_point_id else None
+            if isinstance(by_id, dict):
+                anchor_point_text = str(by_id.get("text") or "").strip()
+        if not anchor_point_text:
+            tier_default = default_point_by_tier.get(retention_tier) or {}
+            anchor_point_text = str(tier_default.get("text") or "").strip()
+        timeline.append(
+            {
+                "turn": turn,
+                "kind": str(check.get("kind") or ""),
+                "probe_question": str(check.get("probe_question") or ""),
+                "retention_tier": retention_tier,
+                "anchor_point_id": anchor_point_id,
+                "anchor_point_text": anchor_point_text,
+                "judge_state": scored["judge_state"],
+                "cause_hint": scored["cause_hint"],
+                "compaction_phase": phase,
+                "miss_confirmed": bool(check.get("miss_confirmed")),
+                "verify_reason": str((check.get("verify_judge") or {}).get("reason") or ""),
+            }
+        )
     return timeline
 
 
@@ -1336,10 +1846,14 @@ def _build_compression_effect_summary_from_sessions(
     sessions_total_input = len(session_payloads)
     sessions_included_verified = 0
     excluded_session_indices: list[int] = []
+    missing_timeline_session_indices: list[int] = []
     tier_total = {"must_keep": 0, "should_keep": 0, "may_drop": 0}
     tier_forgotten_total = {"must_keep": 0, "should_keep": 0, "may_drop": 0}
     tier_post_total = {"must_keep": 0, "should_keep": 0, "may_drop": 0}
     tier_post_forgotten = {"must_keep": 0, "should_keep": 0, "may_drop": 0}
+    timeline_rows_total = 0
+    timeline_rows_included_probe_check = 0
+    timeline_rows_excluded_non_probe_check = 0
     cause_counter: Counter[str] = Counter()
     false_alarm = 0
     first_post_compaction_failures: list[int] = []
@@ -1356,14 +1870,22 @@ def _build_compression_effect_summary_from_sessions(
         sessions_included_verified += 1
         st = session.get("stats")
         if not isinstance(st, dict):
+            missing_timeline_session_indices.append(session_index)
             continue
         timeline = st.get("probe_timeline")
         if not isinstance(timeline, list):
+            missing_timeline_session_indices.append(session_index)
             continue
         first_post_turn: int | None = None
         for item in timeline:
             if not isinstance(item, dict):
                 continue
+            timeline_rows_total += 1
+            kind = str(item.get("kind") or "").strip().lower()
+            if kind != "probe_check":
+                timeline_rows_excluded_non_probe_check += 1
+                continue
+            timeline_rows_included_probe_check += 1
             tier = str(item.get("retention_tier") or "")
             if tier not in tier_total:
                 continue
@@ -1414,6 +1936,7 @@ def _build_compression_effect_summary_from_sessions(
     insufficient_tiers = [tier for tier, row in sample_gate_by_tier.items() if row.get("status") == "insufficient"]
     sample_gate_overall = "sufficient" if not insufficient_tiers else "insufficient"
     excluded_session_indices = sorted({idx for idx in excluded_session_indices if idx > 0})
+    missing_timeline_session_indices = sorted({idx for idx in missing_timeline_session_indices if idx > 0})
     compaction_completion_rate = _rate(sessions_included_verified, sessions_total_input)
 
     return {
@@ -1422,6 +1945,8 @@ def _build_compression_effect_summary_from_sessions(
         "sessions_included_verified_compaction": sessions_included_verified,
         "sessions_excluded_unverified_compaction": len(excluded_session_indices),
         "excluded_session_indices_unverified_compaction": excluded_session_indices,
+        "sessions_with_missing_probe_timeline": len(missing_timeline_session_indices),
+        "missing_probe_timeline_session_indices": missing_timeline_session_indices,
         "compaction_completion_rate": compaction_completion_rate,
         "min_post_samples_per_tier": required_samples,
         "post_compaction_sample_gate": {
@@ -1433,12 +1958,235 @@ def _build_compression_effect_summary_from_sessions(
         "post_compaction_delta_by_tier": post_compaction_delta_by_tier,
         "false_alarm_rate": false_alarm_rate,
         "first_post_compaction_failure_turn": first_post_compaction_failure_turn,
+        "timeline_rows_total": timeline_rows_total,
+        "timeline_rows_included_probe_check": timeline_rows_included_probe_check,
+        "timeline_rows_excluded_non_probe_check": timeline_rows_excluded_non_probe_check,
         "cause_distribution": {k: v for k, v in sorted(cause_counter.items())},
         "tier_sample_count": tier_total,
         "tier_forgotten_count": tier_forgotten_total,
         "tier_post_sample_count": tier_post_total,
         "tier_post_forgotten_count": tier_post_forgotten,
     }
+
+
+def _wilson_interval(success: int, total: int, z: float = 1.96) -> dict[str, Any]:
+    s = max(0, int(success))
+    n = max(0, int(total))
+    if n <= 0:
+        return {
+            "count": s,
+            "total": n,
+            "rate": None,
+            "low": None,
+            "high": None,
+            "half_width": None,
+        }
+    phat = s / n
+    denom = 1.0 + (z * z / n)
+    center = (phat + (z * z / (2.0 * n))) / denom
+    half = z * math.sqrt((phat * (1.0 - phat) + (z * z / (4.0 * n))) / n) / denom
+    low = max(0.0, center - half)
+    high = min(1.0, center + half)
+    return {
+        "count": s,
+        "total": n,
+        "rate": round(phat, 4),
+        "low": round(low, 4),
+        "high": round(high, 4),
+        "half_width": round(max(0.0, high - center), 4),
+    }
+
+
+def _build_statistical_validity_summary(
+    *,
+    aggregate: dict[str, Any],
+    args: ScanArgs,
+) -> dict[str, Any]:
+    effect = aggregate.get("compression_effect_summary") if isinstance(aggregate.get("compression_effect_summary"), dict) else {}
+    health = aggregate.get("pipeline_health_summary") if isinstance(aggregate.get("pipeline_health_summary"), dict) else {}
+    sessions_total = _as_int(aggregate.get("sessions_total"), 0)
+    verified_sessions = _as_int(effect.get("sessions_included_verified_compaction"), 0)
+    run_error_sessions = _as_int(health.get("sessions_with_run_error"), 0)
+    run_error_rate = _as_float(health.get("session_run_error_rate"), 0.0)
+    compaction_completion_rate = _as_float(effect.get("compaction_completion_rate"), 0.0)
+    tier_post = effect.get("tier_post_sample_count") if isinstance(effect.get("tier_post_sample_count"), dict) else {}
+    must_keep_post = _as_int(tier_post.get("must_keep"), 0)
+    should_keep_post = _as_int(tier_post.get("should_keep"), 0)
+    ci_verified = _wilson_interval(verified_sessions, sessions_total)
+    ci_run_error = _wilson_interval(run_error_sessions, sessions_total)
+    ci_half_max = max(0.01, min(0.5, _as_float(args.validity_ci_max_half_width, 0.15)))
+
+    criteria: list[dict[str, Any]] = []
+
+    def push(name: str, passed: bool, observed: Any, threshold: Any, reason: str) -> None:
+        criteria.append(
+            {
+                "name": name,
+                "passed": bool(passed),
+                "observed": observed,
+                "threshold": threshold,
+                "reason": reason,
+            }
+        )
+
+    push(
+        "min_verified_sessions",
+        verified_sessions >= args.validity_min_verified_sessions,
+        verified_sessions,
+        args.validity_min_verified_sessions,
+        (
+            f"verified_sessions={verified_sessions} < min_required={args.validity_min_verified_sessions}"
+            if verified_sessions < args.validity_min_verified_sessions
+            else "ok"
+        ),
+    )
+    push(
+        "max_session_run_error_rate",
+        run_error_rate <= args.validity_max_session_run_error_rate,
+        round(run_error_rate, 4),
+        round(args.validity_max_session_run_error_rate, 4),
+        (
+            f"run_error_rate={round(run_error_rate,4)} > max_allowed={round(args.validity_max_session_run_error_rate,4)}"
+            if run_error_rate > args.validity_max_session_run_error_rate
+            else "ok"
+        ),
+    )
+    push(
+        "min_compaction_completion_rate",
+        compaction_completion_rate >= args.validity_min_compaction_completion_rate,
+        round(compaction_completion_rate, 4),
+        round(args.validity_min_compaction_completion_rate, 4),
+        (
+            f"compaction_completion_rate={round(compaction_completion_rate,4)} < min_required={round(args.validity_min_compaction_completion_rate,4)}"
+            if compaction_completion_rate < args.validity_min_compaction_completion_rate
+            else "ok"
+        ),
+    )
+    push(
+        "must_keep_post_samples",
+        must_keep_post >= args.min_post_samples_per_tier,
+        must_keep_post,
+        args.min_post_samples_per_tier,
+        (
+            f"must_keep_post_samples={must_keep_post} < min_required={args.min_post_samples_per_tier}"
+            if must_keep_post < args.min_post_samples_per_tier
+            else "ok"
+        ),
+    )
+    push(
+        "should_keep_post_samples",
+        should_keep_post >= args.min_post_samples_per_tier,
+        should_keep_post,
+        args.min_post_samples_per_tier,
+        (
+            f"should_keep_post_samples={should_keep_post} < min_required={args.min_post_samples_per_tier}"
+            if should_keep_post < args.min_post_samples_per_tier
+            else "ok"
+        ),
+    )
+    verified_half = _as_float(ci_verified.get("half_width"), -1.0)
+    verified_ci_pass = (verified_half >= 0.0) and (verified_half <= ci_half_max)
+    push(
+        "verified_sessions_ci_half_width",
+        verified_ci_pass,
+        None if verified_half < 0 else round(verified_half, 4),
+        round(ci_half_max, 4),
+        (
+            f"verified_sessions_ci_half_width={round(verified_half,4)} > max_allowed={round(ci_half_max,4)}"
+            if verified_half > ci_half_max
+            else ("insufficient_total_sessions_for_ci" if verified_half < 0 else "ok")
+        ),
+    )
+
+    invalid_reasons = [str(c.get("reason") or "") for c in criteria if not _as_bool(c.get("passed"), False)]
+    status = "valid" if not invalid_reasons else "invalid"
+    return {
+        "status": status,
+        "is_statistically_valid": status == "valid",
+        "criteria": criteria,
+        "invalid_reasons": invalid_reasons,
+        "thresholds": {
+            "min_verified_sessions": args.validity_min_verified_sessions,
+            "max_session_run_error_rate": round(args.validity_max_session_run_error_rate, 4),
+            "min_compaction_completion_rate": round(args.validity_min_compaction_completion_rate, 4),
+            "min_post_samples_per_tier": args.min_post_samples_per_tier,
+            "max_ci_half_width": round(ci_half_max, 4),
+        },
+        "observed": {
+            "sessions_total": sessions_total,
+            "verified_sessions": verified_sessions,
+            "run_error_sessions": run_error_sessions,
+            "run_error_rate": round(run_error_rate, 4),
+            "compaction_completion_rate": round(compaction_completion_rate, 4),
+            "must_keep_post_samples": must_keep_post,
+            "should_keep_post_samples": should_keep_post,
+        },
+        "confidence_intervals_95": {
+            "verified_sessions_rate": ci_verified,
+            "run_error_rate": ci_run_error,
+        },
+    }
+
+
+def _build_statistical_validity_report_md(path: Path, payload: dict[str, Any]) -> None:
+    status = str(payload.get("status") or "invalid")
+    criteria = payload.get("criteria") if isinstance(payload.get("criteria"), list) else []
+    thresholds = payload.get("thresholds") if isinstance(payload.get("thresholds"), dict) else {}
+    observed = payload.get("observed") if isinstance(payload.get("observed"), dict) else {}
+    ci = payload.get("confidence_intervals_95") if isinstance(payload.get("confidence_intervals_95"), dict) else {}
+    invalid_reasons = payload.get("invalid_reasons") if isinstance(payload.get("invalid_reasons"), list) else []
+    lines = [
+        "# 统计有效性证明",
+        "",
+        "> 文档说明：本文件用于判断“本次结果是否具备统计解释力”。",
+        "> 重点看 3 件事：样本规模是否够、过程误差是否可控、区间不确定性是否过大。",
+        "",
+        f"- 结论状态: `{status}`",
+        f"- 是否统计有效: `{bool(payload.get('is_statistically_valid'))}`",
+        "",
+        "## 阈值配置",
+        "",
+        f"- 最小验证会话数: `{thresholds.get('min_verified_sessions')}`",
+        f"- 最大会话运行错误率: `{thresholds.get('max_session_run_error_rate')}`",
+        f"- 最低压缩完成率: `{thresholds.get('min_compaction_completion_rate')}`",
+        f"- 分层最小压缩后样本数: `{thresholds.get('min_post_samples_per_tier')}`",
+        f"- 最大置信区间半宽: `{thresholds.get('max_ci_half_width')}`",
+        "",
+        "## 实际观测",
+        "",
+        f"- 总会话数: `{observed.get('sessions_total')}`",
+        f"- 已验证压缩会话数: `{observed.get('verified_sessions')}`",
+        f"- 发生 run_error 的会话数: `{observed.get('run_error_sessions')}`",
+        f"- 会话运行错误率: `{observed.get('run_error_rate')}`",
+        f"- 压缩完成率: `{observed.get('compaction_completion_rate')}`",
+        f"- must_keep 压缩后样本数: `{observed.get('must_keep_post_samples')}`",
+        f"- should_keep 压缩后样本数: `{observed.get('should_keep_post_samples')}`",
+        "",
+        "## 置信区间（Wilson 95%）",
+        "",
+        f"- 已验证会话占比区间: `{json.dumps(ci.get('verified_sessions_rate', {}), ensure_ascii=False)}`",
+        f"- 运行错误率区间: `{json.dumps(ci.get('run_error_rate', {}), ensure_ascii=False)}`",
+        "",
+        "## 条件检查明细",
+        "",
+        "| 条件名 | 是否通过 | 观测值 | 阈值 | 说明 |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for row in criteria:
+        lines.append(
+            f"| {row.get('name')} | {row.get('passed')} | {row.get('observed')} | "
+            f"{row.get('threshold')} | {row.get('reason')} |"
+        )
+    lines.extend(
+        [
+            "",
+            "## 失败原因汇总",
+            "",
+            f"- 失败原因列表: `{json.dumps(invalid_reasons, ensure_ascii=False)}`",
+            "",
+        ]
+    )
+    path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def _summarize_text(text: str, max_len: int = 160) -> str:
@@ -1514,7 +2262,7 @@ def _write_distribution_svg(path: Path, values: list[int], title: str) -> dict[s
             '<svg xmlns="http://www.w3.org/2000/svg" width="1000" height="420">'
             '<rect x="0" y="0" width="1000" height="420" fill="#f7f7f9"/>'
             f'<text x="40" y="60" font-size="24" fill="#222">{title}</text>'
-            '<text x="40" y="110" font-size="18" fill="#555">No failure samples after warmup sessions.</text>'
+            '<text x="40" y="110" font-size="18" fill="#555">预热会话后暂无失败样本。</text>'
             "</svg>"
         )
         path.write_text(svg + "\n", encoding="utf-8")
@@ -1552,7 +2300,7 @@ def _write_distribution_svg(path: Path, values: list[int], title: str) -> dict[s
             )
         parts.extend(
             [
-                '<text x="500" y="500" font-size="14" text-anchor="middle" fill="#475569">effective failure turn (same as raw)</text>',
+                '<text x="500" y="500" font-size="14" text-anchor="middle" fill="#475569">统计口径：effective failure turn（当前实现与 raw turn 相同）</text>',
                 "</svg>",
             ]
         )
@@ -1583,6 +2331,8 @@ def _classify_run_error_bucket(run_error: str) -> str:
     text = str(run_error or "").strip().lower()
     if not text:
         return "none"
+    if _is_retryable_gateway_404_run_error(text):
+        return "gateway_404"
     if ("401" in text and "unauthorized" in text) or "auth_401_unauthorized" in text:
         return "auth_401"
     if "127.0.0.1" in text and "7890" in text and ("timed out" in text or "timeout" in text):
@@ -1843,20 +2593,49 @@ def _build_probe_runtime_summary(session_payloads: list[dict[str, Any]]) -> dict
     total_skipped_cooldown = 0
     total_skipped_similarity = 0
     total_skipped_empty = 0
+    total_skipped_density = 0
+    total_judge_deterministic_fastpath = 0
+    total_judge_deterministic_only = 0
+    total_judge_llm_suspect = 0
+    total_judge_llm_verify = 0
+    total_judge_llm_verify_forced = 0
+    total_judge_llm_verify_skipped = 0
+    total_turn_gateway_404_retry_attempts = 0
+    total_turn_gateway_404_retry_turns = 0
+    total_turn_gateway_404_retry_success_turns = 0
+    total_turn_gateway_404_retry_exhausted_turns = 0
     total_suppressed = 0
     skipped_reason_counter: Counter[str] = Counter()
+    schedule_reason_counter: Counter[str] = Counter()
     probe_mode_counter: Counter[str] = Counter()
+    judge_mode_counter: Counter[str] = Counter()
 
     for session in session_payloads:
         mode = _normalize_probe_mode(session.get("probe_mode"))
         probe_mode_counter[mode] += 1
         runtime = session.get("probe_runtime") if isinstance(session.get("probe_runtime"), dict) else {}
+        judge_mode_counter[_normalize_probe_judge_mode(runtime.get("probe_judge_mode"))] += 1
         total_scheduled += _as_int(runtime.get("scheduled_probe_turns"), 0)
         total_executed += _as_int(runtime.get("executed_probe_turns"), 0)
         total_regen_retries += _as_int(runtime.get("regen_retries"), 0)
         total_skipped_cooldown += _as_int(runtime.get("skipped_due_cooldown"), 0)
         total_skipped_similarity += _as_int(runtime.get("skipped_due_similarity"), 0)
         total_skipped_empty += _as_int(runtime.get("skipped_due_empty_candidate"), 0)
+        total_skipped_density += _as_int(runtime.get("skipped_due_density_cap"), 0)
+        total_judge_deterministic_fastpath += _as_int(runtime.get("judge_deterministic_fastpath"), 0)
+        total_judge_deterministic_only += _as_int(runtime.get("judge_deterministic_only"), 0)
+        total_judge_llm_suspect += _as_int(runtime.get("judge_llm_suspect"), 0)
+        total_judge_llm_verify += _as_int(runtime.get("judge_llm_verify"), 0)
+        total_judge_llm_verify_forced += _as_int(runtime.get("judge_llm_verify_forced"), 0)
+        total_judge_llm_verify_skipped += _as_int(runtime.get("judge_llm_verify_skipped"), 0)
+        total_turn_gateway_404_retry_attempts += _as_int(runtime.get("turn_gateway_404_retry_attempts"), 0)
+        total_turn_gateway_404_retry_turns += _as_int(runtime.get("turn_gateway_404_retry_turns"), 0)
+        total_turn_gateway_404_retry_success_turns += _as_int(runtime.get("turn_gateway_404_retry_success_turns"), 0)
+        total_turn_gateway_404_retry_exhausted_turns += _as_int(runtime.get("turn_gateway_404_retry_exhausted_turns"), 0)
+        schedule_reasons = runtime.get("schedule_reasons")
+        if isinstance(schedule_reasons, dict):
+            for reason, count in schedule_reasons.items():
+                schedule_reason_counter[str(reason or "unknown")] += max(0, _as_int(count, 0))
         suppressed_turns = runtime.get("suppressed_probe_turns")
         if isinstance(suppressed_turns, list):
             total_suppressed += len(suppressed_turns)
@@ -1876,6 +2655,7 @@ def _build_probe_runtime_summary(session_payloads: list[dict[str, Any]]) -> dict
     return {
         "sessions_total": sessions_total,
         "probe_mode_distribution": dict(sorted(probe_mode_counter.items())),
+        "probe_judge_mode_distribution": dict(sorted(judge_mode_counter.items())),
         "scheduled_probe_turns_total": total_scheduled,
         "executed_probe_turns_total": total_executed,
         "suppressed_probe_turns_total": total_suppressed,
@@ -1885,8 +2665,346 @@ def _build_probe_runtime_summary(session_payloads: list[dict[str, Any]]) -> dict
         "skipped_due_cooldown": total_skipped_cooldown,
         "skipped_due_similarity": total_skipped_similarity,
         "skipped_due_empty_candidate": total_skipped_empty,
+        "skipped_due_density_cap": total_skipped_density,
+        "judge_deterministic_fastpath_total": total_judge_deterministic_fastpath,
+        "judge_deterministic_only_total": total_judge_deterministic_only,
+        "judge_llm_suspect_total": total_judge_llm_suspect,
+        "judge_llm_verify_total": total_judge_llm_verify,
+        "judge_llm_verify_forced_total": total_judge_llm_verify_forced,
+        "judge_llm_verify_skipped_total": total_judge_llm_verify_skipped,
+        "turn_gateway_404_retry_attempts_total": total_turn_gateway_404_retry_attempts,
+        "turn_gateway_404_retry_turns_total": total_turn_gateway_404_retry_turns,
+        "turn_gateway_404_retry_success_turns_total": total_turn_gateway_404_retry_success_turns,
+        "turn_gateway_404_retry_exhausted_turns_total": total_turn_gateway_404_retry_exhausted_turns,
+        "judge_deterministic_fastpath_rate": _rate(total_judge_deterministic_fastpath, total_executed),
+        "judge_deterministic_only_rate": _rate(total_judge_deterministic_only, total_executed),
+        "judge_llm_suspect_rate": _rate(total_judge_llm_suspect, total_executed),
+        "judge_llm_verify_rate": _rate(total_judge_llm_verify, total_executed),
+        "judge_llm_verify_forced_rate": _rate(total_judge_llm_verify_forced, total_executed),
+        "judge_llm_verify_skipped_rate": _rate(total_judge_llm_verify_skipped, total_executed),
+        "turn_gateway_404_retry_turn_rate": _rate(total_turn_gateway_404_retry_turns, sessions_total),
+        "turn_gateway_404_retry_success_rate": _rate(total_turn_gateway_404_retry_success_turns, total_turn_gateway_404_retry_turns),
+        "turn_gateway_404_retry_exhausted_rate": _rate(total_turn_gateway_404_retry_exhausted_turns, total_turn_gateway_404_retry_turns),
+        "schedule_reason_distribution": dict(sorted(schedule_reason_counter.items())),
         "suppressed_reason_distribution": dict(sorted(skipped_reason_counter.items())),
     }
+
+
+def _build_probe_spotcheck_summary(
+    *,
+    session_payloads: list[dict[str, Any]],
+    result_root: Path,
+    probe_llm_cfg: LLMEndpointConfig,
+    args: ScanArgs,
+) -> dict[str, Any]:
+    sample_rate = max(0.01, min(1.0, _as_float(args.spotcheck_sample_rate, 0.25)))
+    min_samples_raw = max(1, _as_int(args.spotcheck_min_samples, 12))
+    max_samples_raw = max(1, _as_int(args.spotcheck_max_samples, 120))
+    min_samples = min(min_samples_raw, max_samples_raw)
+    max_samples = max(min_samples_raw, max_samples_raw)
+    seed = max(0, _as_int(args.spotcheck_seed, 20260426))
+    summary_base = {
+        "enabled": bool(args.spotcheck_enabled),
+        "sample_config": {
+            "sample_rate": sample_rate,
+            "min_samples": min_samples,
+            "max_samples": max_samples,
+            "seed": seed,
+        },
+    }
+    if not args.spotcheck_enabled:
+        return {
+            **summary_base,
+            "status": "disabled",
+            "candidate_count": 0,
+            "sampled_count": 0,
+            "rejudge_success_count": 0,
+            "rejudge_error_count": 0,
+            "agreement": {},
+            "disagreements": [],
+            "error_samples": [],
+        }
+
+    candidates: list[dict[str, Any]] = []
+    for session in session_payloads:
+        session_idx = _as_int(session.get("session_index"), 0)
+        paths = session.get("paths") if isinstance(session.get("paths"), dict) else {}
+        probe_rel = str(paths.get("probe_checks") or "").strip()
+        turn_rel = str(paths.get("turn_results") or "").strip()
+        if not probe_rel or not turn_rel:
+            continue
+        probe_path = result_root / probe_rel
+        turn_path = result_root / turn_rel
+        probe_obj = _read_json_any_file(probe_path)
+        turn_rows = _read_json_any_file(turn_path)
+        if not isinstance(probe_obj, dict) or not isinstance(turn_rows, list):
+            continue
+        checks = probe_obj.get("checks") if isinstance(probe_obj.get("checks"), list) else []
+        anchor = probe_obj.get("anchor") if isinstance(probe_obj.get("anchor"), dict) else {}
+        turn_map: dict[int, dict[str, Any]] = {}
+        for row in turn_rows:
+            if not isinstance(row, dict):
+                continue
+            turn_no = _as_int(row.get("turn"), 0)
+            if turn_no > 0:
+                turn_map[turn_no] = row
+        for check in checks:
+            if not isinstance(check, dict):
+                continue
+            if str(check.get("kind") or "").strip().lower() != "probe_check":
+                continue
+            turn_no = _as_int(check.get("turn"), 0)
+            if turn_no <= 0:
+                continue
+            turn_row = turn_map.get(turn_no, {})
+            probe_question = str(check.get("probe_question") or turn_row.get("user_text") or "").strip()
+            assistant_reply = str(turn_row.get("assistant_text") or "").strip()
+            probe_tier = _normalize_importance_tier(check.get("probe_tier"))
+            candidates.append(
+                {
+                    "session_index": session_idx,
+                    "turn": turn_no,
+                    "probe_question": probe_question,
+                    "assistant_reply": assistant_reply,
+                    "probe_tier": probe_tier,
+                    "check": check,
+                    "anchor": anchor,
+                    "turn_rows": turn_rows,
+                }
+            )
+
+    candidate_count = len(candidates)
+    if candidate_count <= 0:
+        return {
+            **summary_base,
+            "status": "no_candidates",
+            "candidate_count": 0,
+            "sampled_count": 0,
+            "rejudge_success_count": 0,
+            "rejudge_error_count": 0,
+            "agreement": {},
+            "disagreements": [],
+            "error_samples": [],
+        }
+
+    target = int(math.ceil(candidate_count * sample_rate))
+    target = max(min_samples, target)
+    target = min(max_samples, target, candidate_count)
+    rng = random.Random(seed)
+    sampled = candidates if target >= candidate_count else rng.sample(candidates, target)
+
+    def _norm_state(raw: Any, fallback_miss: bool = False) -> str:
+        state = str(raw or "").strip().lower()
+        if state in {JUDGE_REMEMBERED, JUDGE_AMBIGUOUS, JUDGE_FORGOTTEN}:
+            return state
+        return JUDGE_FORGOTTEN if fallback_miss else JUDGE_AMBIGUOUS
+
+    def _norm_cause(raw: Any) -> str:
+        cause = str(raw or "").strip().lower()
+        if not cause:
+            return "none"
+        return cause
+
+    def _rate(num: int, den: int) -> float:
+        if den <= 0:
+            return 0.0
+        return round(num / den, 4)
+
+    miss_agree = 0
+    state_agree = 0
+    cause_agree = 0
+    det_vs_llm_state_agree = 0
+    success_count = 0
+    error_count = 0
+    sampled_by_tier: Counter[str] = Counter()
+    disagreement_by_tier: Counter[str] = Counter()
+    disagreements: list[dict[str, Any]] = []
+    error_samples: list[dict[str, Any]] = []
+
+    for row in sampled:
+        session_idx = _as_int(row.get("session_index"), 0)
+        turn_no = _as_int(row.get("turn"), 0)
+        probe_question = str(row.get("probe_question") or "")
+        assistant_reply = str(row.get("assistant_reply") or "")
+        probe_tier = _normalize_importance_tier(row.get("probe_tier"))
+        sampled_by_tier[probe_tier] += 1
+        check = row.get("check") if isinstance(row.get("check"), dict) else {}
+        anchor = row.get("anchor") if isinstance(row.get("anchor"), dict) else {}
+        turn_rows = row.get("turn_rows") if isinstance(row.get("turn_rows"), list) else []
+
+        original_verify = check.get("verify_judge") if isinstance(check.get("verify_judge"), dict) else {}
+        original_miss = _as_bool(check.get("miss_confirmed"), False)
+        original_state = _norm_state(original_verify.get("judge_state"), fallback_miss=original_miss)
+        original_cause = _norm_cause(original_verify.get("cause_hint"))
+        judge_path = str(check.get("judge_path") or "")
+
+        try:
+            det = _deterministic_probe_judge(
+                anchor=anchor,
+                probe_question=probe_question,
+                assistant_reply=assistant_reply,
+                probe_tier=probe_tier,
+            )
+            suspect = judge_loss_suspected(
+                cfg=probe_llm_cfg,
+                anchor=anchor,
+                probe_question=probe_question,
+                assistant_reply=assistant_reply,
+            )
+            verify = verify_loss_confirmed(
+                cfg=probe_llm_cfg,
+                anchor=anchor,
+                probe_question=probe_question,
+                assistant_reply=assistant_reply,
+                suspect_reason=str(suspect.get("reason_short") or ""),
+                conversation_window=_build_conversation_window(turn_rows, turn_no),
+            )
+            llm_miss = _as_bool(verify.get("forgotten"), False)
+            llm_state = _norm_state(verify.get("judge_state"), fallback_miss=llm_miss)
+            llm_cause = _norm_cause(verify.get("cause_hint"))
+            det_state = _norm_state(det.get("judge_state"), fallback_miss=_as_bool(det.get("forgotten"), False))
+
+            this_miss_agree = llm_miss == original_miss
+            this_state_agree = llm_state == original_state
+            this_cause_agree = llm_cause == original_cause
+            this_det_state_agree = det_state == llm_state
+            miss_agree += 1 if this_miss_agree else 0
+            state_agree += 1 if this_state_agree else 0
+            cause_agree += 1 if this_cause_agree else 0
+            det_vs_llm_state_agree += 1 if this_det_state_agree else 0
+            success_count += 1
+
+            if not (this_miss_agree and this_state_agree and this_cause_agree):
+                disagreement_by_tier[probe_tier] += 1
+                if len(disagreements) < 80:
+                    disagreements.append(
+                        {
+                            "session_index": session_idx,
+                            "turn": turn_no,
+                            "probe_tier": probe_tier,
+                            "judge_path_original": judge_path,
+                            "probe_question_excerpt": _summarize_text(probe_question, max_len=140),
+                            "assistant_excerpt": _summarize_text(assistant_reply, max_len=180),
+                            "original": {
+                                "miss_confirmed": original_miss,
+                                "judge_state": original_state,
+                                "cause_hint": original_cause,
+                            },
+                            "rejudge_llm": {
+                                "miss_confirmed": llm_miss,
+                                "judge_state": llm_state,
+                                "cause_hint": llm_cause,
+                                "reason": str(verify.get("reason") or ""),
+                            },
+                            "rejudge_deterministic": {
+                                "judge_state": det_state,
+                                "reason": str(det.get("reason") or ""),
+                            },
+                        }
+                    )
+        except Exception as exc:
+            error_count += 1
+            if len(error_samples) < 40:
+                error_samples.append(
+                    {
+                        "session_index": session_idx,
+                        "turn": turn_no,
+                        "probe_tier": probe_tier,
+                        "judge_path_original": judge_path,
+                        "probe_question_excerpt": _summarize_text(probe_question, max_len=140),
+                        "assistant_excerpt": _summarize_text(assistant_reply, max_len=180),
+                        "error": f"{exc.__class__.__name__}:{exc}",
+                    }
+                )
+
+    status = "completed"
+    if success_count <= 0 and error_count > 0:
+        status = "failed"
+    elif error_count > 0:
+        status = "completed_with_errors"
+
+    return {
+        **summary_base,
+        "status": status,
+        "candidate_count": candidate_count,
+        "sampled_count": len(sampled),
+        "rejudge_success_count": success_count,
+        "rejudge_error_count": error_count,
+        "sampled_by_tier": dict(sorted(sampled_by_tier.items())),
+        "disagreement_by_tier": dict(sorted(disagreement_by_tier.items())),
+        "agreement": {
+            "original_vs_rejudge_miss_agreement_rate": _rate(miss_agree, success_count),
+            "original_vs_rejudge_state_agreement_rate": _rate(state_agree, success_count),
+            "original_vs_rejudge_cause_agreement_rate": _rate(cause_agree, success_count),
+            "deterministic_vs_rejudge_state_agreement_rate": _rate(det_vs_llm_state_agree, success_count),
+        },
+        "disagreements": disagreements,
+        "error_samples": error_samples,
+    }
+
+
+def _build_probe_spotcheck_report_md(path: Path, payload: dict[str, Any]) -> None:
+    agreement = payload.get("agreement") if isinstance(payload.get("agreement"), dict) else {}
+    sample_cfg = payload.get("sample_config") if isinstance(payload.get("sample_config"), dict) else {}
+    lines = [
+        "# 探针一致性抽检报告",
+        "",
+        "> 文档说明：本文件用于核验“原判定”和“抽样重判”是否一致，评估探针判定稳定性。",
+        "",
+        f"- 抽检状态: `{payload.get('status', '')}`",
+        f"- 是否启用: `{payload.get('enabled', False)}`",
+        f"- 候选样本数: `{payload.get('candidate_count', 0)}`",
+        f"- 实际抽样数: `{payload.get('sampled_count', 0)}`",
+        f"- 重判成功数: `{payload.get('rejudge_success_count', 0)}`",
+        f"- 重判异常数: `{payload.get('rejudge_error_count', 0)}`",
+        "",
+        "## 抽样配置",
+        "",
+        f"- 抽样比例: `{sample_cfg.get('sample_rate', 0.0)}`",
+        f"- 最小样本数: `{sample_cfg.get('min_samples', 0)}`",
+        f"- 最大样本数: `{sample_cfg.get('max_samples', 0)}`",
+        f"- 随机种子: `{sample_cfg.get('seed', 0)}`",
+        "",
+        "## 一致率",
+        "",
+        f"- 原判 vs 重判（是否遗忘）一致率: `{agreement.get('original_vs_rejudge_miss_agreement_rate', 0.0)}`",
+        f"- 原判 vs 重判（状态）一致率: `{agreement.get('original_vs_rejudge_state_agreement_rate', 0.0)}`",
+        f"- 原判 vs 重判（原因）一致率: `{agreement.get('original_vs_rejudge_cause_agreement_rate', 0.0)}`",
+        f"- 确定性判定 vs 重判（状态）一致率: `{agreement.get('deterministic_vs_rejudge_state_agreement_rate', 0.0)}`",
+        "",
+        "## 分层分布",
+        "",
+        f"- 抽样分层分布: `{json.dumps(payload.get('sampled_by_tier', {}), ensure_ascii=False)}`",
+        f"- 分歧分层分布: `{json.dumps(payload.get('disagreement_by_tier', {}), ensure_ascii=False)}`",
+        "",
+        "## 分歧样本（前 20）",
+        "",
+    ]
+    disagreements = payload.get("disagreements") if isinstance(payload.get("disagreements"), list) else []
+    if not disagreements:
+        lines.append("- （无）")
+    else:
+        for item in disagreements[:20]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"- s{item.get('session_index')}/t{item.get('turn')} tier={item.get('probe_tier')} "
+                f"orig={json.dumps(item.get('original', {}), ensure_ascii=False)} "
+                f"llm={json.dumps(item.get('rejudge_llm', {}), ensure_ascii=False)}"
+            )
+    lines.extend(["", "## 异常样本（前 20）", ""])
+    errors = payload.get("error_samples") if isinstance(payload.get("error_samples"), list) else []
+    if not errors:
+        lines.append("- （无）")
+    else:
+        for item in errors[:20]:
+            if not isinstance(item, dict):
+                continue
+            lines.append(
+                f"- s{item.get('session_index')}/t{item.get('turn')} tier={item.get('probe_tier')} "
+                f"error=`{item.get('error', '')}`"
+            )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _build_pipeline_health_report_md(path: Path, payload: dict[str, Any]) -> None:
@@ -1894,44 +3012,46 @@ def _build_pipeline_health_report_md(path: Path, payload: dict[str, Any]) -> Non
     if not isinstance(health, dict):
         health = {}
     lines = [
-        "# Pipeline Health Summary",
+        "# 流水线健康报告",
         "",
-        "## Session-Level",
+        "> 文档说明：本文件用于查看本次运行是否稳定，重点关注 run_error、超时、终态缺失等系统问题。",
         "",
-        f"- sessions_total: `{health.get('sessions_total', 0)}`",
-        f"- session_run_error_rate: `{health.get('session_run_error_rate', 0.0)}`",
-        f"- session_timeout_rate: `{health.get('session_timeout_rate', 0.0)}`",
-        f"- session_stream_closed_rate: `{health.get('session_stream_closed_rate', 0.0)}`",
-        f"- session_terminal_missing_rate: `{health.get('session_terminal_missing_rate', 0.0)}`",
-        f"- session_terminal_reconciled_rate: `{health.get('session_terminal_reconciled_rate', 0.0)}`",
-        f"- session_auto_cancel_attempt_rate: `{health.get('session_auto_cancel_attempt_rate', 0.0)}`",
-        f"- session_auto_cancel_failed_rate: `{health.get('session_auto_cancel_failed_rate', 0.0)}`",
-        f"- session_multi_request_rate: `{health.get('session_multi_request_rate', 0.0)}`",
-        f"- compaction_observed_rate: `{health.get('compaction_observed_rate', 0.0)}`",
-        f"- compaction_completion_verified_rate: `{health.get('compaction_completion_verified_rate', 0.0)}`",
+        "## 会话级指标",
         "",
-        "## Turn-Level",
+        f"- 会话总数: `{health.get('sessions_total', 0)}`",
+        f"- 会话 run_error 比例: `{health.get('session_run_error_rate', 0.0)}`",
+        f"- 会话超时比例: `{health.get('session_timeout_rate', 0.0)}`",
+        f"- 会话流提前关闭比例: `{health.get('session_stream_closed_rate', 0.0)}`",
+        f"- 会话终态缺失比例: `{health.get('session_terminal_missing_rate', 0.0)}`",
+        f"- 会话终态补偿命中比例: `{health.get('session_terminal_reconciled_rate', 0.0)}`",
+        f"- 会话自动取消触发比例: `{health.get('session_auto_cancel_attempt_rate', 0.0)}`",
+        f"- 会话自动取消失败比例: `{health.get('session_auto_cancel_failed_rate', 0.0)}`",
+        f"- 会话多请求比例: `{health.get('session_multi_request_rate', 0.0)}`",
+        f"- 观察到压缩事件比例: `{health.get('compaction_observed_rate', 0.0)}`",
+        f"- 压缩完成验证比例: `{health.get('compaction_completion_verified_rate', 0.0)}`",
         "",
-        f"- turns_total: `{health.get('turns_total', 0)}`",
-        f"- turns_with_run_error: `{health.get('turns_with_run_error', 0)}`",
-        f"- turns_with_timeout: `{health.get('turns_with_timeout', 0)}`",
-        f"- turns_with_stream_closed: `{health.get('turns_with_stream_closed', 0)}`",
-        f"- turns_with_terminal_missing: `{health.get('turns_with_terminal_missing', 0)}`",
-        f"- turns_with_terminal_reconciled: `{health.get('turns_with_terminal_reconciled', 0)}`",
-        f"- turns_with_auto_cancel_attempt: `{health.get('turns_with_auto_cancel_attempt', 0)}`",
-        f"- turns_with_auto_cancel_failed: `{health.get('turns_with_auto_cancel_failed', 0)}`",
-        f"- turns_with_callback_rounds: `{health.get('turns_with_callback_rounds', 0)}`",
-        f"- turns_with_multi_request: `{health.get('turns_with_multi_request', 0)}`",
+        "## 轮次级指标",
         "",
-        "## Distribution",
+        f"- 总轮次数: `{health.get('turns_total', 0)}`",
+        f"- 发生 run_error 的轮次: `{health.get('turns_with_run_error', 0)}`",
+        f"- 超时轮次: `{health.get('turns_with_timeout', 0)}`",
+        f"- 流提前关闭轮次: `{health.get('turns_with_stream_closed', 0)}`",
+        f"- 终态缺失轮次: `{health.get('turns_with_terminal_missing', 0)}`",
+        f"- 终态补偿命中轮次: `{health.get('turns_with_terminal_reconciled', 0)}`",
+        f"- 自动取消触发轮次: `{health.get('turns_with_auto_cancel_attempt', 0)}`",
+        f"- 自动取消失败轮次: `{health.get('turns_with_auto_cancel_failed', 0)}`",
+        f"- callback 轮次: `{health.get('turns_with_callback_rounds', 0)}`",
+        f"- 多请求轮次: `{health.get('turns_with_multi_request', 0)}`",
         "",
-        f"- end_reason_distribution: `{json.dumps(health.get('end_reason_distribution', {}), ensure_ascii=False)}`",
-        f"- run_error_bucket_counts: `{json.dumps(health.get('run_error_bucket_counts', {}), ensure_ascii=False)}`",
-        f"- timeout_session_indices: `{json.dumps(health.get('timeout_session_indices', []), ensure_ascii=False)}`",
-        f"- stream_closed_session_indices: `{json.dumps(health.get('stream_closed_session_indices', []), ensure_ascii=False)}`",
-        f"- terminal_missing_session_indices: `{json.dumps(health.get('terminal_missing_session_indices', []), ensure_ascii=False)}`",
-        f"- terminal_reconciled_session_indices: `{json.dumps(health.get('terminal_reconciled_session_indices', []), ensure_ascii=False)}`",
-        f"- auto_cancel_failed_session_indices: `{json.dumps(health.get('auto_cancel_failed_session_indices', []), ensure_ascii=False)}`",
+        "## 分布与定位",
+        "",
+        f"- 结束原因分布: `{json.dumps(health.get('end_reason_distribution', {}), ensure_ascii=False)}`",
+        f"- run_error 分桶统计: `{json.dumps(health.get('run_error_bucket_counts', {}), ensure_ascii=False)}`",
+        f"- 超时会话索引: `{json.dumps(health.get('timeout_session_indices', []), ensure_ascii=False)}`",
+        f"- 流关闭会话索引: `{json.dumps(health.get('stream_closed_session_indices', []), ensure_ascii=False)}`",
+        f"- 终态缺失会话索引: `{json.dumps(health.get('terminal_missing_session_indices', []), ensure_ascii=False)}`",
+        f"- 终态补偿会话索引: `{json.dumps(health.get('terminal_reconciled_session_indices', []), ensure_ascii=False)}`",
+        f"- 自动取消失败会话索引: `{json.dumps(health.get('auto_cancel_failed_session_indices', []), ensure_ascii=False)}`",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -1949,53 +3069,93 @@ def _build_result_markdown(path: Path, payload: dict[str, Any]) -> None:
     probe_runtime = aggregate.get("probe_runtime_summary")
     if not isinstance(probe_runtime, dict):
         probe_runtime = {}
+    spotcheck = aggregate.get("probe_spotcheck_summary")
+    if not isinstance(spotcheck, dict):
+        spotcheck = {}
+    validity = aggregate.get("statistical_validity")
+    if not isinstance(validity, dict):
+        validity = {}
     sessions = payload.get("sessions", [])
     lines = [
-        "# Memory Compression Failure Scan",
+        "# 压缩测试总览",
         "",
-        f"- runtime_env: `{cfg.get('runtime_env', '')}`",
-        f"- sessions: `{cfg.get('sessions', 0)}`",
-        f"- warmup_sessions_excluded: `{cfg.get('warmup_sessions', 0)}`",
-        f"- hard_max_turns: `{cfg.get('hard_max_turns', 0)}`",
-        f"- turn_timeout_sec: `{cfg.get('turn_timeout_sec', 0)}`",
-        f"- session_wall_timeout_sec: `{cfg.get('session_wall_timeout_sec', 0)}`",
-        f"- probe_interval: `{cfg.get('probe_interval', 0)}`",
-        f"- probe_mode: `{cfg.get('probe_mode', 'hidden')}`",
-        f"- probe_cooldown_turns: `{cfg.get('probe_cooldown_turns', 0)}`",
-        f"- probe_similarity_threshold: `{cfg.get('probe_similarity_threshold', 0.0)}`",
-        f"- probe_recent_window: `{cfg.get('probe_recent_window', 0)}`",
-        f"- probe_regen_max_attempts: `{cfg.get('probe_regen_max_attempts', 0)}`",
-        f"- focus_window: `{cfg.get('focus_window', 0)}`",
-        f"- parallel_sessions: `{cfg.get('parallel_sessions', 1)}`",
-        f"- importance_tier: `{cfg.get('importance_tier', 'should_keep')}`",
-        f"- results_root: `{cfg.get('results_root', '')}`",
+        "> 文档说明：本文件是本次运行的总入口，先给配置与核心指标，再给会话级列表，帮助你快速定位结果。",
         "",
-        "## Aggregate",
+        "## 运行配置",
         "",
-        f"- sessions_with_failure: `{aggregate.get('sessions_with_failure', 0)}`",
-        f"- sessions_without_failure: `{aggregate.get('sessions_without_failure', 0)}`",
-        f"- evaluated_sessions_for_chart: `{aggregate.get('evaluated_sessions_for_chart', 0)}`",
-        f"- chart_samples: `{aggregate.get('chart_samples', 0)}`",
-        f"- chart_type: `{chart.get('chart_type', '')}`",
-        f"- chart_path: `{chart.get('chart_path', '')}`",
-        f"- pipeline_health.compaction_completion_verified_rate: `{health.get('compaction_completion_verified_rate', 0.0)}`",
-        f"- pipeline_health.session_timeout_rate: `{health.get('session_timeout_rate', 0.0)}`",
-        f"- pipeline_health.session_terminal_missing_rate: `{health.get('session_terminal_missing_rate', 0.0)}`",
-        f"- pipeline_health.session_auto_cancel_failed_rate: `{health.get('session_auto_cancel_failed_rate', 0.0)}`",
-        f"- pipeline_health.run_error_bucket_counts: `{json.dumps(health.get('run_error_bucket_counts', {}), ensure_ascii=False)}`",
-        f"- probe_runtime.executed_probe_turn_rate: `{probe_runtime.get('executed_probe_turn_rate', 0.0)}`",
-        f"- probe_runtime.suppressed_probe_turn_rate: `{probe_runtime.get('suppressed_probe_turn_rate', 0.0)}`",
-        f"- probe_runtime.suppressed_reason_distribution: `{json.dumps(probe_runtime.get('suppressed_reason_distribution', {}), ensure_ascii=False)}`",
-        f"- compression_effect.sessions_included_verified: `{effect.get('sessions_included_verified_compaction', 0)}`",
-        f"- compression_effect.sample_gate: `{json.dumps((effect.get('post_compaction_sample_gate') or {}), ensure_ascii=False)}`",
+        f"- 运行环境: `{cfg.get('runtime_env', '')}`",
+        f"- 会话数量: `{cfg.get('sessions', 0)}`",
+        f"- 预热会话数（不计图表）: `{cfg.get('warmup_sessions', 0)}`",
+        f"- 单会话最大轮次: `{cfg.get('hard_max_turns', 0)}`",
+        f"- 单轮超时秒数: `{cfg.get('turn_timeout_sec', 0)}`",
+        f"- 会话墙钟超时秒数: `{cfg.get('session_wall_timeout_sec', 0)}`",
+        f"- 探针间隔: `{cfg.get('probe_interval', 0)}`",
+        f"- 探针模式: `{cfg.get('probe_mode', 'hidden')}`",
+        f"- 探针冷却轮次: `{cfg.get('probe_cooldown_turns', 0)}`",
+        f"- 探针相似度阈值: `{cfg.get('probe_similarity_threshold', 0.0)}`",
+        f"- 探针近窗: `{cfg.get('probe_recent_window', 0)}`",
+        f"- 探针重生上限: `{cfg.get('probe_regen_max_attempts', 0)}`",
+        f"- 压缩后高频窗口: `{json.dumps(cfg.get('probe_post_compaction_window_offsets', []), ensure_ascii=False)}`",
+        f"- 探针密度上限: `{cfg.get('probe_max_density', 0.0)}`",
+        f"- 评判模式: `{cfg.get('probe_judge_mode', 'llm_only')}`",
+        f"- 跳过 fastpath: `{cfg.get('probe_llm_skip_fastpath', True)}`",
+        f"- verify 强制执行: `{cfg.get('probe_llm_verify_always', True)}`",
+        f"- 抽检启用: `{cfg.get('spotcheck_enabled', True)}`",
+        f"- 抽检比例: `{cfg.get('spotcheck_sample_rate', 0.0)}`",
+        f"- 抽检最小样本: `{cfg.get('spotcheck_min_samples', 0)}`",
+        f"- 抽检最大样本: `{cfg.get('spotcheck_max_samples', 0)}`",
+        f"- 抽检随机种子: `{cfg.get('spotcheck_seed', 0)}`",
+        f"- 网关 404 兜底重试上限: `{cfg.get('turn_gateway_404_retry_max', 0)}`",
+        f"- 网关 404 兜底退避秒数: `{cfg.get('turn_gateway_404_retry_backoff_sec', 0.0)}`",
+        f"- 聚焦窗口: `{cfg.get('focus_window', 0)}`",
+        f"- 并发会话数: `{cfg.get('parallel_sessions', 1)}`",
+        f"- 重要性层级: `{cfg.get('importance_tier', 'should_keep')}`",
+        f"- 断点续跑: `{cfg.get('checkpoint_resume_enabled', True)}`",
+        f"- 统计最小验证会话数: `{cfg.get('validity_min_verified_sessions', 0)}`",
+        f"- 统计最大 run_error 率: `{cfg.get('validity_max_session_run_error_rate', 0.0)}`",
+        f"- 统计最小压缩完成率: `{cfg.get('validity_min_compaction_completion_rate', 0.0)}`",
+        f"- 统计最大 CI 半宽: `{cfg.get('validity_ci_max_half_width', 0.0)}`",
+        f"- 结果目录: `{cfg.get('results_root', '')}`",
         "",
-        "## Distribution (effective turn = raw turn)",
+        "## 核心指标",
         "",
-        f"- stats: `{json.dumps(aggregate.get('effective_turn_stats', {}), ensure_ascii=False)}`",
+        f"- 失败会话数: `{aggregate.get('sessions_with_failure', 0)}`",
+        f"- 无失败会话数: `{aggregate.get('sessions_without_failure', 0)}`",
+        f"- 图表统计会话数: `{aggregate.get('evaluated_sessions_for_chart', 0)}`",
+        f"- 图表样本数: `{aggregate.get('chart_samples', 0)}`",
+        f"- 图表类型: `{chart.get('chart_type', '')}`",
+        f"- 图表路径: `{chart.get('chart_path', '')}`",
+        f"- 流水线：压缩完成验证率: `{health.get('compaction_completion_verified_rate', 0.0)}`",
+        f"- 流水线：会话超时率: `{health.get('session_timeout_rate', 0.0)}`",
+        f"- 流水线：终态缺失率: `{health.get('session_terminal_missing_rate', 0.0)}`",
+        f"- 流水线：自动取消失败率: `{health.get('session_auto_cancel_failed_rate', 0.0)}`",
+        f"- 流水线：run_error 分桶: `{json.dumps(health.get('run_error_bucket_counts', {}), ensure_ascii=False)}`",
+        f"- 探针运行：执行率: `{probe_runtime.get('executed_probe_turn_rate', 0.0)}`",
+        f"- 探针运行：抑制率: `{probe_runtime.get('suppressed_probe_turn_rate', 0.0)}`",
+        f"- 探针运行：密度抑制次数: `{probe_runtime.get('skipped_due_density_cap', 0)}`",
+        f"- 探针运行：评判模式分布: `{json.dumps(probe_runtime.get('probe_judge_mode_distribution', {}), ensure_ascii=False)}`",
+        f"- 探针运行：调度原因分布: `{json.dumps(probe_runtime.get('schedule_reason_distribution', {}), ensure_ascii=False)}`",
+        f"- 探针运行：LLM suspect 比例: `{probe_runtime.get('judge_llm_suspect_rate', 0.0)}`",
+        f"- 探针运行：LLM verify 比例: `{probe_runtime.get('judge_llm_verify_rate', 0.0)}`",
+        f"- 探针运行：404 兜底触发率: `{probe_runtime.get('turn_gateway_404_retry_turn_rate', 0.0)}`",
+        f"- 探针运行：404 兜底成功率: `{probe_runtime.get('turn_gateway_404_retry_success_rate', 0.0)}`",
+        f"- 抽检：状态: `{spotcheck.get('status', '')}`",
+        f"- 抽检：样本数: `{spotcheck.get('sampled_count', 0)}`",
+        f"- 抽检：重判成功数: `{spotcheck.get('rejudge_success_count', 0)}`",
+        f"- 抽检：重判异常数: `{spotcheck.get('rejudge_error_count', 0)}`",
+        f"- 抽检：一致率: `{json.dumps(spotcheck.get('agreement', {}), ensure_ascii=False)}`",
+        f"- 压缩效果：纳入验证会话数: `{effect.get('sessions_included_verified_compaction', 0)}`",
+        f"- 压缩效果：样本门槛状态: `{json.dumps((effect.get('post_compaction_sample_gate') or {}), ensure_ascii=False)}`",
+        f"- 统计有效性：状态: `{validity.get('status', 'invalid')}`",
+        f"- 统计有效性：失败原因: `{json.dumps(validity.get('invalid_reasons', []), ensure_ascii=False)}`",
         "",
-        "## Sessions",
+        "## 分布统计（effective turn = raw turn）",
         "",
-        "| session | mode | focus_turn | first_failure_raw | first_failure_effective | turns_executed | end_reason |",
+        f"- 轮次统计: `{json.dumps(aggregate.get('effective_turn_stats', {}), ensure_ascii=False)}`",
+        "",
+        "## 会话清单",
+        "",
+        "| 会话 | 模式 | 聚焦轮次 | 首次失败(raw) | 首次失败(effective) | 执行轮次 | 结束原因 |",
         "| --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in sessions:
@@ -2012,22 +3172,24 @@ def _build_llm_report(path: Path, payload: dict[str, Any]) -> None:
     sessions = payload.get("sessions", [])
     anchor = payload.get("anchor", {})
     lines = [
-        "# Memory Failure LLM Report",
+        "# 探针与判定明细报告",
         "",
-        "## Probe Anchor",
+        "> 文档说明：本文件展示探针锚点、各会话探针执行情况及失败诊断线索，用于人工复盘。",
         "",
-        f"- anchor_id: `{anchor.get('anchor_id', '')}`",
-        f"- anchor_name: `{anchor.get('anchor_name', '')}`",
-        "- anchor_points:",
+        "## 探针锚点",
+        "",
+        f"- 锚点 ID: `{anchor.get('anchor_id', '')}`",
+        f"- 锚点名称: `{anchor.get('anchor_name', '')}`",
+        "- 锚点内容:",
     ]
     for p in anchor.get("anchor_points", []):
         lines.append(f"  - {p}")
     lines.extend(
         [
             "",
-            "## Sessions",
+            "## 会话概览",
             "",
-            "| session | probe_mode | first_failure_raw | first_failure_effective | end_reason | probe_checks |",
+            "| 会话 | 探针模式 | 首次失败(raw) | 首次失败(effective) | 结束原因 | 探针条数 |",
             "| --- | --- | --- | --- | --- | --- |",
         ]
     )
@@ -2039,21 +3201,21 @@ def _build_llm_report(path: Path, payload: dict[str, Any]) -> None:
         )
         probe_path = row.get("paths", {}).get("probe_checks", "")
         if probe_path:
-            lines.append(f"  - probe_checks: `{probe_path}`")
+            lines.append(f"  - 探针文件: `{probe_path}`")
         runtime = row.get("probe_runtime") if isinstance(row.get("probe_runtime"), dict) else {}
         if runtime:
             lines.append(
-                "  - probe_runtime: "
+                "  - 运行统计: "
                 f"`executed={runtime.get('executed_probe_turns', 0)}, "
                 f"suppressed={len(runtime.get('suppressed_probe_turns') or [])}, "
                 f"retries={runtime.get('regen_retries', 0)}`"
             )
         diagnosis = row.get("failure_diagnosis")
         if isinstance(diagnosis, dict) and diagnosis:
-            lines.append(f"  - loss_turn: `{diagnosis.get('turn')}`")
-            lines.append(f"  - suspect_reason: `{diagnosis.get('suspect_reason')}`")
-            lines.append(f"  - verify_reason: `{diagnosis.get('verify_reason')}`")
-            lines.append(f"  - evidence_refs: `{diagnosis.get('evidence_refs')}`")
+            lines.append(f"  - 失效轮次: `{diagnosis.get('turn')}`")
+            lines.append(f"  - 初判理由: `{diagnosis.get('suspect_reason')}`")
+            lines.append(f"  - 复核理由: `{diagnosis.get('verify_reason')}`")
+            lines.append(f"  - 证据索引: `{diagnosis.get('evidence_refs')}`")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -2068,47 +3230,227 @@ def _build_compression_effect_report_md(path: Path, payload: dict[str, Any]) -> 
     if not isinstance(contract_profile, dict):
         contract_profile = {}
     lines = [
-        "# Compression Effect Summary",
+        "# 压缩效果报告",
         "",
-        "## Core Metrics",
+        "> 文档说明：本文件聚焦“压缩前后”的探针表现变化，用于判断压缩是否带来可解释影响。",
         "",
-        f"- sessions_total_input: `{effect.get('sessions_total_input', 0)}`",
-        f"- sessions_total: `{effect.get('sessions_total', 0)}`",
-        f"- sessions_excluded_unverified_compaction: `{effect.get('sessions_excluded_unverified_compaction', 0)}`",
-        f"- compaction_completion_rate: `{effect.get('compaction_completion_rate', 0.0)}`",
-        f"- retention_rate_by_tier: `{json.dumps(effect.get('retention_rate_by_tier', {}), ensure_ascii=False)}`",
-        f"- post_compaction_delta_by_tier: `{json.dumps(effect.get('post_compaction_delta_by_tier', {}), ensure_ascii=False)}`",
-        f"- false_alarm_rate: `{effect.get('false_alarm_rate', 0.0)}`",
-        f"- first_post_compaction_failure_turn: `{json.dumps(effect.get('first_post_compaction_failure_turn', {}), ensure_ascii=False)}`",
+        "## 核心指标",
         "",
-        "## Post-Compaction Sample Gate",
+        f"- 输入会话总数: `{effect.get('sessions_total_input', 0)}`",
+        f"- 纳入会话总数: `{effect.get('sessions_total', 0)}`",
+        f"- 未验证压缩而排除的会话数: `{effect.get('sessions_excluded_unverified_compaction', 0)}`",
+        f"- 已验证但缺失时间线的会话数: `{effect.get('sessions_with_missing_probe_timeline', 0)}`",
+        f"- 压缩完成率: `{effect.get('compaction_completion_rate', 0.0)}`",
+        f"- 分层保留率: `{json.dumps(effect.get('retention_rate_by_tier', {}), ensure_ascii=False)}`",
+        f"- 压缩后分层变化量: `{json.dumps(effect.get('post_compaction_delta_by_tier', {}), ensure_ascii=False)}`",
+        f"- 误报率: `{effect.get('false_alarm_rate', 0.0)}`",
+        f"- 首次压缩后失败轮次分布: `{json.dumps(effect.get('first_post_compaction_failure_turn', {}), ensure_ascii=False)}`",
         "",
-        f"- min_post_samples_per_tier: `{effect.get('min_post_samples_per_tier', 0)}`",
-        f"- post_compaction_sample_gate: `{json.dumps(effect.get('post_compaction_sample_gate', {}), ensure_ascii=False)}`",
+        "## 压缩后样本门槛",
         "",
-        "## Gating",
+        f"- 分层最小样本要求: `{effect.get('min_post_samples_per_tier', 0)}`",
+        f"- 样本门槛状态: `{json.dumps(effect.get('post_compaction_sample_gate', {}), ensure_ascii=False)}`",
         "",
-        f"- configured_importance_tier: `{payload.get('config', {}).get('importance_tier', 'should_keep')}`",
+        "## 门控配置",
         "",
-        "## Diagnosis",
+        f"- 当前门控层级: `{payload.get('config', {}).get('importance_tier', 'should_keep')}`",
         "",
-        f"- cause_distribution: `{json.dumps(effect.get('cause_distribution', {}), ensure_ascii=False)}`",
-        f"- tier_sample_count: `{json.dumps(effect.get('tier_sample_count', {}), ensure_ascii=False)}`",
-        f"- tier_forgotten_count: `{json.dumps(effect.get('tier_forgotten_count', {}), ensure_ascii=False)}`",
-        f"- tier_post_sample_count: `{json.dumps(effect.get('tier_post_sample_count', {}), ensure_ascii=False)}`",
-        f"- tier_post_forgotten_count: `{json.dumps(effect.get('tier_post_forgotten_count', {}), ensure_ascii=False)}`",
+        "## 诊断",
         "",
-        "## Contract",
+        f"- 时间线总条数: `{effect.get('timeline_rows_total', 0)}`",
+        f"- 纳入统计（probe_check）条数: `{effect.get('timeline_rows_included_probe_check', 0)}`",
+        f"- 排除条数（非 probe_check）: `{effect.get('timeline_rows_excluded_non_probe_check', 0)}`",
+        f"- 原因分布: `{json.dumps(effect.get('cause_distribution', {}), ensure_ascii=False)}`",
+        f"- 分层样本数: `{json.dumps(effect.get('tier_sample_count', {}), ensure_ascii=False)}`",
+        f"- 分层遗忘数: `{json.dumps(effect.get('tier_forgotten_count', {}), ensure_ascii=False)}`",
+        f"- 分层压缩后样本数: `{json.dumps(effect.get('tier_post_sample_count', {}), ensure_ascii=False)}`",
+        f"- 分层压缩后遗忘数: `{json.dumps(effect.get('tier_post_forgotten_count', {}), ensure_ascii=False)}`",
         "",
-        f"- contract_profile_id: `{contract_profile.get('profile_id', '')}`",
-        f"- contract_anchor_name: `{contract_profile.get('anchor_name', '')}`",
-        f"- memory_channel_expectation: `{contract_profile.get('memory_channel_expectation', '')}`",
-        f"- failure_policy: `{json.dumps(contract_profile.get('failure_policy', {}), ensure_ascii=False)}`",
+        "## 契约配置",
         "",
-        "## Notes",
+        f"- 契约 Profile ID: `{contract_profile.get('profile_id', '')}`",
+        f"- 契约锚点名称: `{contract_profile.get('anchor_name', '')}`",
+        f"- 记忆通道期望: `{contract_profile.get('memory_channel_expectation', '')}`",
+        f"- 失败策略: `{json.dumps(contract_profile.get('failure_policy', {}), ensure_ascii=False)}`",
+        "",
+        "## 备注",
         "",
         "- `must_keep` 丢失应视作红线故障；`should_keep` 用于压缩退化监控；`may_drop` 仅用于减负观察。",
         "- `false_alarm_rate` 为非 compression_related 的遗忘比例，用于抑制业务换题误报。",
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _collect_probe_outcome_rows(
+    *,
+    session_payloads: list[dict[str, Any]],
+    result_root: Path,
+) -> dict[str, list[dict[str, Any]]]:
+    pass_rows: list[dict[str, Any]] = []
+    fail_rows: list[dict[str, Any]] = []
+    for session in session_payloads:
+        session_index = _as_int(session.get("session_index"), 0)
+        paths = session.get("paths") if isinstance(session.get("paths"), dict) else {}
+        probe_rel = str(paths.get("probe_checks") or "").strip()
+        turn_rel = str(paths.get("turn_results") or "").strip()
+        if not probe_rel:
+            continue
+        probe_obj = _read_json_any_file(result_root / probe_rel)
+        turn_rows = _read_json_any_file(result_root / turn_rel) if turn_rel else None
+        checks = probe_obj.get("checks") if isinstance(probe_obj, dict) and isinstance(probe_obj.get("checks"), list) else []
+        turn_map: dict[int, dict[str, Any]] = {}
+        if isinstance(turn_rows, list):
+            for tr in turn_rows:
+                if not isinstance(tr, dict):
+                    continue
+                turn_no = _as_int(tr.get("turn"), 0)
+                if turn_no > 0:
+                    turn_map[turn_no] = tr
+        for check in checks:
+            if not isinstance(check, dict):
+                continue
+            if str(check.get("kind") or "").strip().lower() != "probe_check":
+                continue
+            turn_no = _as_int(check.get("turn"), 0)
+            tr = turn_map.get(turn_no, {})
+            verify = check.get("verify_judge") if isinstance(check.get("verify_judge"), dict) else {}
+            suspect = check.get("suspect_judge") if isinstance(check.get("suspect_judge"), dict) else {}
+            miss_confirmed = _as_bool(check.get("miss_confirmed"), False)
+            judge_state = str(verify.get("judge_state") or "").strip().lower()
+            if judge_state not in {JUDGE_REMEMBERED, JUDGE_AMBIGUOUS, JUDGE_FORGOTTEN}:
+                judge_state = JUDGE_FORGOTTEN if miss_confirmed else JUDGE_REMEMBERED
+            cause_hint = str(verify.get("cause_hint") or "").strip().lower() or (
+                CAUSE_UNKNOWN if miss_confirmed else "none"
+            )
+            probe_question = str(check.get("probe_question") or tr.get("user_text") or "").strip()
+            assistant_text = str(tr.get("assistant_text") or "").strip()
+            if not assistant_text:
+                assistant_text = str(check.get("assistant_excerpt") or "").strip()
+            row = {
+                "session_index": session_index,
+                "turn": turn_no,
+                "probe_tier": _normalize_importance_tier(check.get("probe_tier")),
+                "judge_path": str(check.get("judge_path") or "").strip(),
+                "judge_state": judge_state,
+                "cause_hint": cause_hint,
+                "miss_confirmed": miss_confirmed,
+                "probe_question": probe_question,
+                "assistant_text": assistant_text,
+                "suspect_reason": str(suspect.get("reason_short") or "").strip(),
+                "verify_reason": str(verify.get("reason") or "").strip(),
+                "evidence_refs": verify.get("evidence_refs"),
+                "probe_signature": str(check.get("probe_signature") or "").strip(),
+            }
+            if miss_confirmed:
+                fail_rows.append(row)
+            else:
+                pass_rows.append(row)
+    pass_rows.sort(key=lambda x: (int(x.get("session_index") or 0), int(x.get("turn") or 0)))
+    fail_rows.sort(key=lambda x: (int(x.get("session_index") or 0), int(x.get("turn") or 0)))
+    return {"pass": pass_rows, "fail": fail_rows}
+
+
+def _build_probe_outcome_report_md(
+    *,
+    path: Path,
+    rows: list[dict[str, Any]],
+    report_title: str,
+    report_intro: str,
+) -> None:
+    lines = [
+        f"# {report_title}",
+        "",
+        f"> 文档说明：{report_intro}",
+        "",
+        f"- 样本条数: `{len(rows)}`",
+        "",
+    ]
+    if not rows:
+        lines.append("- （无样本）")
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return
+    lines.extend(
+        [
+            "| 序号 | 会话 | 轮次 | 分层 | 判定状态 | 原因类型 | 判定路径 |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+        ]
+    )
+    for idx, row in enumerate(rows, start=1):
+        lines.append(
+            f"| {idx} | {row.get('session_index')} | {row.get('turn')} | "
+            f"{row.get('probe_tier')} | {row.get('judge_state')} | {row.get('cause_hint')} | {row.get('judge_path')} |"
+        )
+    lines.append("")
+    lines.append("## 逐条详情")
+    lines.append("")
+    for idx, row in enumerate(rows, start=1):
+        lines.extend(
+            [
+                f"### #{idx} 会话{row.get('session_index')} 轮次{row.get('turn')}",
+                "",
+                f"- 判定状态: `{row.get('judge_state')}`",
+                f"- 原因类型: `{row.get('cause_hint')}`",
+                f"- 判定路径: `{row.get('judge_path')}`",
+                f"- 初判理由: `{row.get('suspect_reason')}`",
+                f"- 复核理由: `{row.get('verify_reason')}`",
+                f"- 证据索引: `{json.dumps(row.get('evidence_refs'), ensure_ascii=False)}`",
+                "- 探针原文:",
+                "```text",
+                str(row.get("probe_question") or ""),
+                "```",
+                "- 助手原文:",
+                "```text",
+                str(row.get("assistant_text") or ""),
+                "```",
+                "",
+            ]
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _build_results_readme_md(path: Path) -> None:
+    lines = [
+        "# 结果目录说明",
+        "",
+        "> 文档说明：本文件用于快速理解 `results/memory_failure/<run_id>/` 下每类产物的用途。",
+        "> 使用顺序建议：先看 `aggregate/summary.md`，再看 `pipeline_health_report.md` 与 `compression_effect_report.md`，最后下钻 `sessions/`。",
+        "",
+        "## 顶层文件",
+        "",
+        "- `run_manifest.json`：本次运行的索引文件，列出关键产物路径。",
+        "- `README.md`：当前目录说明（即本文件）。",
+        "",
+        "## aggregate 目录",
+        "",
+        "- `summary.json`：机器可读总汇总，包含 config、aggregate、sessions。",
+        "- `summary.md`：给人读的总览报告（中文）。",
+        "- `pipeline_health_summary.json`：流水线健康统计（机器可读）。",
+        "- `pipeline_health_report.md`：流水线健康报告（中文）。",
+        "- `compression_effect_summary.json`：压缩效果统计（机器可读）。",
+        "- `compression_effect_report.md`：压缩效果报告（中文）。",
+        "- `memory_failure_llm_report.md`：探针与判定总览（中文）。",
+        "- `probe_spotcheck_summary.json`：探针一致性抽检统计（机器可读）。",
+        "- `probe_spotcheck_report.md`：探针一致性抽检报告（中文）。",
+        "- `probe_checks_pass.json`：全部“通过”探针清单（机器可读）。",
+        "- `probe_checks_pass.md`：全部“通过”探针展示（中文，含理由与原文）。",
+        "- `probe_checks_fail.json`：全部“失败”探针清单（机器可读）。",
+        "- `probe_checks_fail.md`：全部“失败”探针展示（中文，含理由与原文）。",
+        "- `statistical_validity_summary.json`：统计有效性判定结果（机器可读）。",
+        "- `statistical_validity_proof.md`：统计有效性证明（中文）。",
+        "- `failure_turn_distribution.svg`：失败轮次分布图。",
+        "",
+        "## sessions 目录",
+        "",
+        "- `session_xx/dialogue.md`：用户视角的会话逐轮记录。",
+        "- `session_xx/raw_events.jsonl`：底层事件流明细，适合排障和追事件时序。",
+        "- `session_xx/session_meta.json`：该会话摘要和文件路径索引。",
+        "- `session_xx/run_data/turn_results.json`：逐轮执行结果（含 run_error/terminal/retry 字段）。",
+        "- `session_xx/run_data/probe_checks.json`：探针判定结果明细。",
+        "- `session_xx/run_data/probe_timeline.json`：探针按压缩前后分相位时间线。",
+        "- `session_xx/run_data/compaction_events.json`：压缩事件识别与完成验证信息。",
+        "- `session_xx/run_data/session_checkpoint.json`：断点续跑状态快照（若启用）。",
+        "- `session_xx/workspace/_manifest.json`：工作区导出文件清单。",
+        "",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -2120,86 +3462,262 @@ def _run_single_session(shared: SharedRuntime, session_idx: int, focus_turn: int
     run_data_dir.mkdir(parents=True, exist_ok=True)
 
     scan_mode = _build_scan_mode_label(focus_turn, shared.args.focus_window)
-    probe_id = f"{PROBE_KIND_MEMORY_POINT}-{session_idx:02d}-{uuid.uuid4().hex[:6]}"
+    checkpoint_path = run_data_dir / SESSION_CHECKPOINT_FILE_NAME
+    resume_enabled = bool(shared.args.checkpoint_resume_enabled)
+    checkpoint_obj = _read_json_file(checkpoint_path) if resume_enabled else {}
+    checkpoint_status = str(checkpoint_obj.get("status") or "").strip().lower()
+    is_resume_candidate = (
+        resume_enabled
+        and bool(checkpoint_obj)
+        and _as_int(checkpoint_obj.get("session_index"), 0) == session_idx
+        and checkpoint_status not in {"completed", "finalized"}
+    )
+
+    probe_id = str(checkpoint_obj.get("probe_id") or "").strip() if is_resume_candidate else ""
+    if not probe_id:
+        probe_id = f"{PROBE_KIND_MEMORY_POINT}-{session_idx:02d}-{uuid.uuid4().hex[:6]}"
+
     probe_turns_executed: list[int] = []
     contract_profile = _load_contract_anchor_profile()
-    anchor = _merge_anchor_with_contract(build_default_probe_anchor(), contract_profile)
-    failure_policy = _parse_failure_policy(anchor.get("failure_policy"))
+    anchor = checkpoint_obj.get("anchor") if is_resume_candidate and isinstance(checkpoint_obj.get("anchor"), dict) else {}
+    if not anchor:
+        anchor = _merge_anchor_with_contract(build_default_probe_anchor(), contract_profile)
+    failure_policy = (
+        checkpoint_obj.get("failure_policy")
+        if is_resume_candidate and isinstance(checkpoint_obj.get("failure_policy"), dict)
+        else _parse_failure_policy(anchor.get("failure_policy"))
+    )
 
     print(
         f"[INFO] session_start index={session_idx} mode={scan_mode} "
         f"focus_turn={focus_turn} probe_mode={_normalize_probe_mode(shared.args.probe_mode)}"
     )
 
-    try:
-        generated_role: GeneratedRole = generate_role_for_session(shared.user_sim_cfg)
-        print(f"[INFO] user_role session={session_idx} role_name={generated_role.role_name}")
-    except Exception as exc:
-        print(f"[WARN] user_role_fallback session={session_idx} reason={exc.__class__.__name__}")
-        generated_role = GeneratedRole(
-            role_name=f"memory-scan-user-{session_idx:02d}",
-            role_profile=(
-                "- role_name: memory-scan-user\n"
-                "- identity: operation specialist\n"
-                "- goal: iterate copy and image assets"
-            ),
-            role_json={
-                "role_name": f"memory-scan-user-{session_idx:02d}",
-                "identity": "operation specialist",
-                "current_goal": "iterate copy and image assets",
-            },
+    generated_role = _generated_role_from_dict(checkpoint_obj.get("generated_role")) if is_resume_candidate else None
+    if generated_role is None:
+        try:
+            generated_role = generate_role_for_session(shared.user_sim_cfg)
+            print(f"[INFO] user_role session={session_idx} role_name={generated_role.role_name}")
+        except Exception as exc:
+            print(f"[WARN] user_role_fallback session={session_idx} reason={exc.__class__.__name__}")
+            generated_role = GeneratedRole(
+                role_name=f"memory-scan-user-{session_idx:02d}",
+                role_profile=(
+                    "- role_name: memory-scan-user\n"
+                    "- identity: operation specialist\n"
+                    "- goal: iterate copy and image assets"
+                ),
+                role_json={
+                    "role_name": f"memory-scan-user-{session_idx:02d}",
+                    "identity": "operation specialist",
+                    "current_goal": "iterate copy and image assets",
+                },
+            )
+    elif is_resume_candidate:
+        print(
+            "[INFO] session_resume_role "
+            f"index={session_idx} role_name={generated_role.role_name}"
         )
-    sim_state = UserSimulatorState(previous_response_id="")
 
-    turn_results: list[dict[str, Any]] = []
-    probe_checks: list[dict[str, Any]] = []
-    first_failure_turn_raw: int | None = None
-    failure_diagnosis: dict[str, Any] = {}
-    create_trace_obj: dict[str, Any] = {}
+    sim_state = (
+        _sim_state_from_dict(checkpoint_obj.get("sim_state"))
+        if is_resume_candidate
+        else UserSimulatorState(previous_response_id="")
+    )
+
+    turn_results: list[dict[str, Any]] = (
+        checkpoint_obj.get("turn_results")
+        if is_resume_candidate and isinstance(checkpoint_obj.get("turn_results"), list)
+        else []
+    )
+    probe_checks: list[dict[str, Any]] = (
+        checkpoint_obj.get("probe_checks")
+        if is_resume_candidate and isinstance(checkpoint_obj.get("probe_checks"), list)
+        else []
+    )
+    first_failure_turn_raw: int | None = (
+        _as_int(checkpoint_obj.get("first_failure_turn_raw"), 0) or None
+        if is_resume_candidate
+        else None
+    )
+    failure_diagnosis: dict[str, Any] = (
+        checkpoint_obj.get("failure_diagnosis")
+        if is_resume_candidate and isinstance(checkpoint_obj.get("failure_diagnosis"), dict)
+        else {}
+    )
+    create_trace_obj: dict[str, Any] = (
+        checkpoint_obj.get("create_trace")
+        if is_resume_candidate and isinstance(checkpoint_obj.get("create_trace"), dict)
+        else {}
+    )
     end_reason = "unknown"
-    session_id = ""
+    session_id = str(checkpoint_obj.get("session_id") or "").strip() if is_resume_candidate else ""
     raw_events_path = session_dir / "raw_events.jsonl"
-    latest_workspace_snapshot: dict[str, Any] | None = None
-    probe_recent_texts: list[str] = []
-    probe_last_turn_by_signature: dict[str, int] = {}
+    latest_workspace_snapshot: dict[str, Any] | None = (
+        checkpoint_obj.get("latest_workspace_snapshot")
+        if is_resume_candidate and isinstance(checkpoint_obj.get("latest_workspace_snapshot"), dict)
+        else None
+    )
+    probe_recent_texts: list[str] = (
+        checkpoint_obj.get("probe_recent_texts")
+        if is_resume_candidate and isinstance(checkpoint_obj.get("probe_recent_texts"), list)
+        else []
+    )
+    probe_last_turn_by_signature: dict[str, int] = (
+        checkpoint_obj.get("probe_last_turn_by_signature")
+        if is_resume_candidate and isinstance(checkpoint_obj.get("probe_last_turn_by_signature"), dict)
+        else {}
+    )
+    if is_resume_candidate and isinstance(checkpoint_obj.get("probe_turns_executed"), list):
+        probe_turns_executed = [max(1, _as_int(v, 0)) for v in checkpoint_obj.get("probe_turns_executed") if _as_int(v, 0) > 0]
+    first_compaction_signal_turn: int | None = (
+        _as_int(checkpoint_obj.get("first_compaction_signal_turn"), 0) or None
+        if is_resume_candidate
+        else None
+    )
     probe_control_cfg = {
         "probe_mode": _normalize_probe_mode(shared.args.probe_mode),
+        "probe_judge_mode": _normalize_probe_judge_mode(shared.args.probe_judge_mode),
+        "probe_llm_skip_fastpath": bool(shared.args.probe_llm_skip_fastpath),
+        "probe_llm_verify_always": bool(shared.args.probe_llm_verify_always),
+        "turn_gateway_404_retry_max": shared.args.turn_gateway_404_retry_max,
+        "turn_gateway_404_retry_backoff_sec": shared.args.turn_gateway_404_retry_backoff_sec,
         "probe_cooldown_turns": shared.args.probe_cooldown_turns,
         "probe_similarity_threshold": shared.args.probe_similarity_threshold,
         "probe_recent_window": shared.args.probe_recent_window,
         "probe_regen_max_attempts": shared.args.probe_regen_max_attempts,
+        "probe_post_compaction_window_offsets": list(shared.args.probe_post_compaction_window_offsets),
+        "probe_max_density": shared.args.probe_max_density,
     }
-    probe_runtime_stats: dict[str, Any] = {
-        "probe_mode": _normalize_probe_mode(shared.args.probe_mode),
-        "scheduled_probe_turns": 0,
-        "executed_probe_turns": 0,
-        "regen_retries": 0,
-        "skipped_due_cooldown": 0,
-        "skipped_due_similarity": 0,
-        "skipped_due_empty_candidate": 0,
-        "suppressed_probe_turns": [],
-    }
-
-    with raw_events_path.open("w", encoding="utf-8") as raw_fp:
-        session_id, create_trace = create_session(
-            shared.cfg.base_url,
-            shared.headers,
-            persist_type=shared.persist_type,
-            settings_json=shared.create_settings_json,
-        )
-        create_trace_obj = {
-            "request_id": create_trace.request_id,
-            "traceparent": create_trace.traceparent,
-            "tracestate": create_trace.tracestate,
-            "x_trace_id": create_trace.x_trace_id,
-            "backend_trace_id": create_trace.backend_trace_id,
+    probe_runtime_stats: dict[str, Any] = (
+        checkpoint_obj.get("probe_runtime_stats")
+        if is_resume_candidate and isinstance(checkpoint_obj.get("probe_runtime_stats"), dict)
+        else {}
+    )
+    if not probe_runtime_stats:
+        probe_runtime_stats = {
+            "probe_mode": _normalize_probe_mode(shared.args.probe_mode),
+            "probe_judge_mode": _normalize_probe_judge_mode(shared.args.probe_judge_mode),
+            "scheduled_probe_turns": 0,
+            "executed_probe_turns": 0,
+            "regen_retries": 0,
+            "skipped_due_cooldown": 0,
+            "skipped_due_similarity": 0,
+            "skipped_due_empty_candidate": 0,
+            "skipped_due_density_cap": 0,
+            "judge_deterministic_fastpath": 0,
+            "judge_deterministic_only": 0,
+            "judge_llm_suspect": 0,
+            "judge_llm_verify": 0,
+            "judge_llm_verify_forced": 0,
+            "judge_llm_verify_skipped": 0,
+            "turn_gateway_404_retry_attempts": 0,
+            "turn_gateway_404_retry_turns": 0,
+            "turn_gateway_404_retry_success_turns": 0,
+            "turn_gateway_404_retry_exhausted_turns": 0,
+            "suppressed_probe_turns": [],
+            "schedule_reasons": {},
         }
-        print(f"[INFO] session_created index={session_idx} session_id={session_id}")
+    else:
+        probe_runtime_stats.setdefault("probe_mode", _normalize_probe_mode(shared.args.probe_mode))
+        probe_runtime_stats.setdefault("probe_judge_mode", _normalize_probe_judge_mode(shared.args.probe_judge_mode))
+        probe_runtime_stats.setdefault("scheduled_probe_turns", 0)
+        probe_runtime_stats.setdefault("executed_probe_turns", 0)
+        probe_runtime_stats.setdefault("regen_retries", 0)
+        probe_runtime_stats.setdefault("skipped_due_cooldown", 0)
+        probe_runtime_stats.setdefault("skipped_due_similarity", 0)
+        probe_runtime_stats.setdefault("skipped_due_empty_candidate", 0)
+        probe_runtime_stats.setdefault("skipped_due_density_cap", 0)
+        probe_runtime_stats.setdefault("judge_deterministic_fastpath", 0)
+        probe_runtime_stats.setdefault("judge_deterministic_only", 0)
+        probe_runtime_stats.setdefault("judge_llm_suspect", 0)
+        probe_runtime_stats.setdefault("judge_llm_verify", 0)
+        probe_runtime_stats.setdefault("judge_llm_verify_forced", 0)
+        probe_runtime_stats.setdefault("judge_llm_verify_skipped", 0)
+        probe_runtime_stats.setdefault("turn_gateway_404_retry_attempts", 0)
+        probe_runtime_stats.setdefault("turn_gateway_404_retry_turns", 0)
+        probe_runtime_stats.setdefault("turn_gateway_404_retry_success_turns", 0)
+        probe_runtime_stats.setdefault("turn_gateway_404_retry_exhausted_turns", 0)
+        probe_runtime_stats.setdefault("suppressed_probe_turns", [])
+        probe_runtime_stats.setdefault("schedule_reasons", {})
+    session_resume_count = _as_int(checkpoint_obj.get("resume_count"), 0) if is_resume_candidate else 0
 
-        turn_idx = 1
+    def flush_checkpoint(*, status: str, next_turn_idx: int, current_turn: int, turn_kind: str, user_text: str) -> None:
+        if not resume_enabled:
+            return
+        payload = {
+            "version": "v1",
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+            "status": str(status or "").strip().lower(),
+            "session_index": session_idx,
+            "scan_mode": scan_mode,
+            "probe_id": probe_id,
+            "resume_count": session_resume_count,
+            "session_id": session_id,
+            "create_trace": create_trace_obj,
+            "generated_role": _generated_role_to_dict(generated_role),
+            "sim_state": _sim_state_to_dict(sim_state),
+            "turn_results": turn_results,
+            "probe_checks": probe_checks,
+            "first_failure_turn_raw": first_failure_turn_raw,
+            "failure_diagnosis": failure_diagnosis,
+            "probe_turns_executed": probe_turns_executed,
+            "probe_recent_texts": probe_recent_texts[-50:],
+            "probe_last_turn_by_signature": probe_last_turn_by_signature,
+            "probe_runtime_stats": probe_runtime_stats,
+            "first_compaction_signal_turn": first_compaction_signal_turn,
+            "anchor": anchor,
+            "failure_policy": failure_policy,
+            "latest_workspace_snapshot": latest_workspace_snapshot or {},
+            "next_turn_idx": max(1, _as_int(next_turn_idx, 1)),
+            "current_turn": max(0, _as_int(current_turn, 0)),
+            "current_turn_kind": str(turn_kind or ""),
+            "current_user_text": str(user_text or ""),
+            "session_started_at": session_started_at,
+            "end_reason": end_reason,
+        }
+        _write_json_file(checkpoint_path, payload)
+
+    raw_open_mode = "a" if is_resume_candidate and raw_events_path.exists() else "w"
+    with raw_events_path.open(raw_open_mode, encoding="utf-8") as raw_fp:
+        if not session_id:
+            session_id, create_trace = create_session(
+                shared.cfg.base_url,
+                shared.headers,
+                persist_type=shared.persist_type,
+                settings_json=shared.create_settings_json,
+            )
+            create_trace_obj = {
+                "request_id": create_trace.request_id,
+                "traceparent": create_trace.traceparent,
+                "tracestate": create_trace.tracestate,
+                "x_trace_id": create_trace.x_trace_id,
+                "backend_trace_id": create_trace.backend_trace_id,
+            }
+            print(f"[INFO] session_created index={session_idx} session_id={session_id}")
+        else:
+            session_resume_count += 1
+            print(
+                "[INFO] session_resume "
+                f"index={session_idx} session_id={session_id} "
+                f"turn_results={len(turn_results)} probe_checks={len(probe_checks)}"
+            )
+
+        turn_idx = max(1, _as_int(checkpoint_obj.get("next_turn_idx"), len(turn_results) + 1)) if is_resume_candidate else 1
         session_turn_cap = 40 if shared.args.hard_max_turns <= 0 else min(40, shared.args.hard_max_turns)
-        session_started_at = time.time()
+        session_started_at = (
+            float(checkpoint_obj.get("session_started_at"))
+            if is_resume_candidate and _as_float(checkpoint_obj.get("session_started_at"), 0.0) > 0
+            else time.time()
+        )
         session_wall_timeout_sec = max(0, _as_int(shared.args.session_wall_timeout_sec, 0))
+        flush_checkpoint(
+            status="ready_for_turn",
+            next_turn_idx=turn_idx,
+            current_turn=max(0, turn_idx - 1),
+            turn_kind="",
+            user_text="",
+        )
         while True:
             if session_wall_timeout_sec > 0 and (time.time() - session_started_at) > session_wall_timeout_sec:
                 end_reason = "session_wall_timeout"
@@ -2220,81 +3738,123 @@ def _run_single_session(shared: SharedRuntime, session_idx: int, focus_turn: int
             elif turn_idx == 2:
                 user_text = str(anchor.get("plant_message") or "")
                 turn_kind = "plant_probe"
-            elif _should_probe_turn(
-                turn_idx=turn_idx,
-                coarse_interval=shared.args.probe_interval,
-                focus_turn=focus_turn,
-                focus_window=shared.args.focus_window,
-            ):
-                probe_runtime_stats["scheduled_probe_turns"] = _as_int(
-                    probe_runtime_stats.get("scheduled_probe_turns"), 0
-                ) + 1
-                probe_check_index = len(probe_turns_executed) + 1
-                probe_tier = _extract_probe_tier(anchor, probe_check_index, shared.args.importance_tier)
-                candidate_selected: dict[str, Any] | None = None
-                reject_reason = "candidate_empty"
-                recent_history = _render_recent_history(turn_results)
-                for attempt in range(0, shared.args.probe_regen_max_attempts + 1):
-                    candidate_meta = _build_probe_question_candidate(
-                        shared=shared,
-                        anchor=anchor,
-                        turn_idx=turn_idx,
-                        probe_index=probe_check_index,
-                        probe_tier=probe_tier,
-                        recent_history=recent_history,
-                        variant_offset=attempt,
-                    )
-                    candidate_text = str(candidate_meta.get("probe_user_text") or "").strip()
-                    candidate_signature = str(candidate_meta.get("probe_signature") or "").strip()
-                    accepted, reason, max_similarity = _judge_probe_candidate(
-                        candidate_text=candidate_text,
-                        candidate_signature=candidate_signature,
-                        turn_idx=turn_idx,
-                        recent_probe_texts=probe_recent_texts,
-                        probe_last_turn_by_signature=probe_last_turn_by_signature,
-                        similarity_threshold=shared.args.probe_similarity_threshold,
-                        recent_window=shared.args.probe_recent_window,
-                        cooldown_turns=shared.args.probe_cooldown_turns,
-                    )
-                    candidate_meta["probe_generation_attempt"] = attempt + 1
-                    candidate_meta["probe_similarity_to_recent"] = round(max_similarity, 4)
-                    if accepted:
-                        candidate_selected = candidate_meta
-                        break
-
-                    reject_reason = reason or "candidate_rejected"
-                    if reject_reason.startswith("cooldown_active"):
-                        probe_runtime_stats["skipped_due_cooldown"] = _as_int(
-                            probe_runtime_stats.get("skipped_due_cooldown"), 0
-                        ) + 1
-                    elif reject_reason.startswith("similarity_high"):
-                        probe_runtime_stats["skipped_due_similarity"] = _as_int(
-                            probe_runtime_stats.get("skipped_due_similarity"), 0
-                        ) + 1
-                    else:
-                        probe_runtime_stats["skipped_due_empty_candidate"] = _as_int(
-                            probe_runtime_stats.get("skipped_due_empty_candidate"), 0
-                        ) + 1
-                    if attempt < shared.args.probe_regen_max_attempts:
-                        probe_runtime_stats["regen_retries"] = _as_int(probe_runtime_stats.get("regen_retries"), 0) + 1
-
-                if candidate_selected:
-                    turn_kind = "probe_check"
-                    user_text = str(candidate_selected.get("probe_user_text") or "").strip()
-                    probe_question_meta = candidate_selected
-                    probe_turns_executed.append(turn_idx)
-                    probe_runtime_stats["executed_probe_turns"] = _as_int(
-                        probe_runtime_stats.get("executed_probe_turns"), 0
+            else:
+                should_probe, schedule_reason = _should_schedule_probe_turn(
+                    turn_idx=turn_idx,
+                    coarse_interval=shared.args.probe_interval,
+                    focus_turn=focus_turn,
+                    focus_window=shared.args.focus_window,
+                    first_compaction_signal_turn=first_compaction_signal_turn,
+                    post_compaction_window_offsets=shared.args.probe_post_compaction_window_offsets,
+                    executed_probe_turns=probe_turns_executed,
+                    max_probe_density=shared.args.probe_max_density,
+                )
+                if should_probe:
+                    probe_runtime_stats["scheduled_probe_turns"] = _as_int(
+                        probe_runtime_stats.get("scheduled_probe_turns"), 0
                     ) + 1
-                    signature = str(candidate_selected.get("probe_signature") or "").strip()
-                    if signature:
-                        probe_last_turn_by_signature[signature] = turn_idx
-                    if user_text:
-                        probe_recent_texts.append(user_text)
-                        keep_window = max(6, shared.args.probe_recent_window * 3)
-                        if len(probe_recent_texts) > keep_window:
-                            probe_recent_texts = probe_recent_texts[-keep_window:]
+                    schedule_reasons = (
+                        probe_runtime_stats.get("schedule_reasons")
+                        if isinstance(probe_runtime_stats.get("schedule_reasons"), dict)
+                        else {}
+                    )
+                    schedule_reasons[str(schedule_reason or "unknown")] = _as_int(
+                        schedule_reasons.get(str(schedule_reason or "unknown")), 0
+                    ) + 1
+                    probe_runtime_stats["schedule_reasons"] = schedule_reasons
+                    probe_check_index = len(probe_turns_executed) + 1
+                    probe_tier = _extract_probe_tier(anchor, probe_check_index, shared.args.importance_tier)
+                    candidate_selected: dict[str, Any] | None = None
+                    reject_reason = "candidate_empty"
+                    recent_history = _render_recent_history(turn_results)
+                    for attempt in range(0, shared.args.probe_regen_max_attempts + 1):
+                        candidate_meta = _build_probe_question_candidate(
+                            shared=shared,
+                            anchor=anchor,
+                            turn_idx=turn_idx,
+                            probe_index=probe_check_index,
+                            probe_tier=probe_tier,
+                            recent_history=recent_history,
+                            variant_offset=attempt,
+                        )
+                        candidate_text = str(candidate_meta.get("probe_user_text") or "").strip()
+                        candidate_signature = str(candidate_meta.get("probe_signature") or "").strip()
+                        accepted, reason, max_similarity = _judge_probe_candidate(
+                            candidate_text=candidate_text,
+                            candidate_signature=candidate_signature,
+                            turn_idx=turn_idx,
+                            recent_probe_texts=probe_recent_texts,
+                            probe_last_turn_by_signature=probe_last_turn_by_signature,
+                            similarity_threshold=shared.args.probe_similarity_threshold,
+                            recent_window=shared.args.probe_recent_window,
+                            cooldown_turns=shared.args.probe_cooldown_turns,
+                        )
+                        candidate_meta["probe_generation_attempt"] = attempt + 1
+                        candidate_meta["probe_similarity_to_recent"] = round(max_similarity, 4)
+                        candidate_meta["probe_schedule_reason"] = schedule_reason
+                        if accepted:
+                            candidate_selected = candidate_meta
+                            break
+
+                        reject_reason = reason or "candidate_rejected"
+                        if reject_reason.startswith("cooldown_active"):
+                            probe_runtime_stats["skipped_due_cooldown"] = _as_int(
+                                probe_runtime_stats.get("skipped_due_cooldown"), 0
+                            ) + 1
+                        elif reject_reason.startswith("similarity_high"):
+                            probe_runtime_stats["skipped_due_similarity"] = _as_int(
+                                probe_runtime_stats.get("skipped_due_similarity"), 0
+                            ) + 1
+                        else:
+                            probe_runtime_stats["skipped_due_empty_candidate"] = _as_int(
+                                probe_runtime_stats.get("skipped_due_empty_candidate"), 0
+                            ) + 1
+                        if attempt < shared.args.probe_regen_max_attempts:
+                            probe_runtime_stats["regen_retries"] = _as_int(probe_runtime_stats.get("regen_retries"), 0) + 1
+
+                    if candidate_selected:
+                        turn_kind = "probe_check"
+                        user_text = str(candidate_selected.get("probe_user_text") or "").strip()
+                        probe_question_meta = candidate_selected
+                        probe_turns_executed.append(turn_idx)
+                        probe_runtime_stats["executed_probe_turns"] = _as_int(
+                            probe_runtime_stats.get("executed_probe_turns"), 0
+                        ) + 1
+                        signature = str(candidate_selected.get("probe_signature") or "").strip()
+                        if signature:
+                            probe_last_turn_by_signature[signature] = turn_idx
+                        if user_text:
+                            probe_recent_texts.append(user_text)
+                            keep_window = max(6, shared.args.probe_recent_window * 3)
+                            if len(probe_recent_texts) > keep_window:
+                                probe_recent_texts = probe_recent_texts[-keep_window:]
+                    else:
+                        user_text, turn_kind, sim_state = _generate_filler_user_turn(
+                            shared=shared,
+                            sim_state=sim_state,
+                            turn_results=turn_results,
+                            generated_role=generated_role,
+                            turn_idx=turn_idx,
+                            latest_workspace_snapshot=latest_workspace_snapshot,
+                            session_idx=session_idx,
+                            session_id=session_id,
+                        )
+                        suppressed_turns = probe_runtime_stats.get("suppressed_probe_turns")
+                        if isinstance(suppressed_turns, list):
+                            suppressed_turns.append(
+                                {
+                                    "turn": turn_idx,
+                                    "reason": reject_reason,
+                                    "probe_tier": probe_tier,
+                                    "probe_mode": _normalize_probe_mode(shared.args.probe_mode),
+                                    "schedule_reason": schedule_reason,
+                                }
+                            )
                 else:
+                    if schedule_reason.startswith("density_"):
+                        probe_runtime_stats["skipped_due_density_cap"] = _as_int(
+                            probe_runtime_stats.get("skipped_due_density_cap"), 0
+                        ) + 1
                     user_text, turn_kind, sim_state = _generate_filler_user_turn(
                         shared=shared,
                         sim_state=sim_state,
@@ -2305,59 +3865,97 @@ def _run_single_session(shared: SharedRuntime, session_idx: int, focus_turn: int
                         session_idx=session_idx,
                         session_id=session_id,
                     )
-                    suppressed_turns = probe_runtime_stats.get("suppressed_probe_turns")
-                    if isinstance(suppressed_turns, list):
-                        suppressed_turns.append(
-                            {
-                                "turn": turn_idx,
-                                "reason": reject_reason,
-                                "probe_tier": probe_tier,
-                                "probe_mode": _normalize_probe_mode(shared.args.probe_mode),
-                            }
-                        )
-            else:
-                user_text, turn_kind, sim_state = _generate_filler_user_turn(
-                    shared=shared,
-                    sim_state=sim_state,
-                    turn_results=turn_results,
-                    generated_role=generated_role,
-                    turn_idx=turn_idx,
-                    latest_workspace_snapshot=latest_workspace_snapshot,
-                    session_idx=session_idx,
-                    session_id=session_id,
-                )
 
-            try:
-                result = execute_turn(
-                    base_url=shared.cfg.base_url,
-                    headers=shared.headers,
-                    session_id=session_id,
-                    persist_type=shared.persist_type,
-                    exec_max_turns=shared.exec_max_turns,
-                    run_settings=shared.run_settings,
-                    user_text=user_text,
-                    turn_idx=turn_idx,
-                    raw_events_fp=raw_fp,
+            flush_checkpoint(
+                status="in_execute",
+                next_turn_idx=turn_idx,
+                current_turn=turn_idx,
+                turn_kind=turn_kind,
+                user_text=user_text,
+            )
+
+            gateway_retry_records: list[dict[str, Any]] = []
+            gateway_retry_max = max(0, _as_int(shared.args.turn_gateway_404_retry_max, 1))
+            gateway_retry_base_backoff_sec = max(0.0, _as_float(shared.args.turn_gateway_404_retry_backoff_sec, 2.0))
+            gateway_retry_attempt = 0
+            while True:
+                try:
+                    result = execute_turn(
+                        base_url=shared.cfg.base_url,
+                        headers=shared.headers,
+                        session_id=session_id,
+                        persist_type=shared.persist_type,
+                        exec_max_turns=shared.exec_max_turns,
+                        run_settings=shared.run_settings,
+                        user_text=user_text,
+                        turn_idx=turn_idx,
+                        raw_events_fp=raw_fp,
+                    )
+                except Exception as exc:
+                    result = {
+                        "turn": turn_idx,
+                        "user_text": user_text,
+                        "assistant_text": "",
+                        "event_count": 0,
+                        "run_end": False,
+                        "run_error": f"EXECUTE_TURN_EXCEPTION:{exc.__class__.__name__}:{str(exc)}",
+                        "terminal_event_type": "",
+                        "terminal_event_seen": False,
+                        "terminal_missing": False,
+                        "terminal_reconcile": {
+                            "attempted": False,
+                            "status": "execute_turn_exception",
+                            "terminal_found": False,
+                        },
+                        "workspace_event_paths": [],
+                        "workspace_snapshot": {},
+                        "duration_sec": 0.0,
+                    }
+
+                run_error_text = str(result.get("run_error") or "")
+                retryable_gateway_404 = _is_retryable_gateway_404_run_error(run_error_text)
+                can_retry_gateway_404 = retryable_gateway_404 and (gateway_retry_attempt < gateway_retry_max)
+                if not can_retry_gateway_404:
+                    break
+
+                gateway_retry_attempt += 1
+                wait_sec = round(gateway_retry_base_backoff_sec * gateway_retry_attempt, 3)
+                gateway_retry_records.append(
+                    {
+                        "attempt": gateway_retry_attempt,
+                        "wait_sec": wait_sec,
+                        "run_error": run_error_text,
+                    }
                 )
-            except Exception as exc:
-                result = {
-                    "turn": turn_idx,
-                    "user_text": user_text,
-                    "assistant_text": "",
-                    "event_count": 0,
-                    "run_end": False,
-                    "run_error": f"EXECUTE_TURN_EXCEPTION:{exc.__class__.__name__}:{str(exc)}",
-                    "terminal_event_type": "",
-                    "terminal_event_seen": False,
-                    "terminal_missing": False,
-                    "terminal_reconcile": {
-                        "attempted": False,
-                        "status": "execute_turn_exception",
-                        "terminal_found": False,
-                    },
-                    "workspace_event_paths": [],
-                    "workspace_snapshot": {},
-                    "duration_sec": 0.0,
+                print(
+                    "[WARN] turn_gateway_404_retry "
+                    f"session={session_idx} turn={turn_idx} "
+                    f"attempt={gateway_retry_attempt}/{gateway_retry_max} wait_sec={wait_sec}"
+                )
+                if wait_sec > 0:
+                    time.sleep(wait_sec)
+
+            if gateway_retry_records:
+                probe_runtime_stats["turn_gateway_404_retry_attempts"] = _as_int(
+                    probe_runtime_stats.get("turn_gateway_404_retry_attempts"), 0
+                ) + len(gateway_retry_records)
+                probe_runtime_stats["turn_gateway_404_retry_turns"] = _as_int(
+                    probe_runtime_stats.get("turn_gateway_404_retry_turns"), 0
+                ) + 1
+                if result.get("run_error"):
+                    probe_runtime_stats["turn_gateway_404_retry_exhausted_turns"] = _as_int(
+                        probe_runtime_stats.get("turn_gateway_404_retry_exhausted_turns"), 0
+                    ) + 1
+                else:
+                    probe_runtime_stats["turn_gateway_404_retry_success_turns"] = _as_int(
+                        probe_runtime_stats.get("turn_gateway_404_retry_success_turns"), 0
+                    ) + 1
+                result["gateway_404_retry"] = {
+                    "enabled": gateway_retry_max > 0,
+                    "max_attempts": gateway_retry_max,
+                    "attempts_used": len(gateway_retry_records),
+                    "records": gateway_retry_records,
+                    "final_status": "success" if not result.get("run_error") else "exhausted",
                 }
             result["turn_kind"] = turn_kind
             turn_results.append(result)
@@ -2369,55 +3967,119 @@ def _run_single_session(shared: SharedRuntime, session_idx: int, focus_turn: int
                 suspect_obj: dict[str, Any] = {}
                 verify_obj: dict[str, Any] = {}
                 miss_confirmed = False
+                judge_path = ""
+                deterministic_judge: dict[str, Any] = {}
 
                 if turn_kind == "plant_probe":
                     suspect_obj = {"loss_suspected": False, "reason_short": "plant_turn_no_loss_check"}
                     verify_obj = {"forgotten": False, "reason": "plant_turn_no_verify"}
+                    judge_path = "plant_no_judge"
                 else:
                     probe_question = str(probe_question_meta.get("probe_user_text") or user_text)
-                    try:
-                        suspect_obj = judge_loss_suspected(
-                            cfg=shared.probe_llm_cfg,
-                            anchor=anchor,
-                            probe_question=probe_question,
-                            assistant_reply=assistant_text,
-                        )
-                    except Exception as exc:
-                        suspect_obj = {
-                            "loss_suspected": False,
-                            "confidence_0_1": 0.0,
-                            "remembered_points": [],
-                            "missing_points": [],
-                            "reason_short": f"suspect_judge_error:{exc.__class__.__name__}:{exc}",
-                        }
+                    probe_tier = _normalize_importance_tier(
+                        probe_question_meta.get("probe_tier") or shared.args.importance_tier
+                    )
+                    judge_mode = _normalize_probe_judge_mode(shared.args.probe_judge_mode)
+                    deterministic_judge = _deterministic_probe_judge(
+                        anchor=anchor,
+                        probe_question=probe_question,
+                        assistant_reply=assistant_text,
+                        probe_tier=probe_tier,
+                    )
 
-                    if bool(suspect_obj.get("loss_suspected")):
-                        try:
-                            verify_obj = verify_loss_confirmed(
-                                cfg=shared.probe_llm_cfg,
-                                anchor=anchor,
-                                probe_question=probe_question,
-                                assistant_reply=assistant_text,
-                                suspect_reason=str(suspect_obj.get("reason_short") or ""),
-                                conversation_window=_build_conversation_window(turn_results, turn_idx),
-                            )
-                        except Exception as exc:
-                            verify_obj = {
-                                "forgotten": False,
-                                "confidence_0_1": 0.0,
-                                "score_0_100": 0.0,
-                                "reason": f"verify_judge_error:{exc.__class__.__name__}:{exc}",
-                                "evidence_refs": [],
-                            }
+                    if judge_mode == "deterministic":
+                        suspect_obj, verify_obj, miss_confirmed = _build_judge_objects_from_deterministic(
+                            deterministic_judge
+                        )
+                        judge_path = "deterministic_only"
+                        probe_runtime_stats["judge_deterministic_only"] = _as_int(
+                            probe_runtime_stats.get("judge_deterministic_only"), 0
+                        ) + 1
                     else:
-                        verify_obj = {
-                            "forgotten": False,
-                            "confidence_0_1": 0.0,
-                            "score_0_100": 0.0,
-                            "reason": "suspect_false_skip_verify",
-                            "evidence_refs": [],
-                        }
-                    miss_confirmed = bool(verify_obj.get("forgotten"))
+                        deterministic_state = str(deterministic_judge.get("judge_state") or JUDGE_AMBIGUOUS).strip().lower()
+                        deterministic_conf = _as_float(deterministic_judge.get("confidence_0_1"), 0.0)
+                        allow_fastpath = not bool(shared.args.probe_llm_skip_fastpath)
+                        use_deterministic_fastpath = (
+                            judge_mode == "hybrid"
+                            and allow_fastpath
+                            and deterministic_state == JUDGE_REMEMBERED
+                            and deterministic_conf >= 0.75
+                        )
+                        if use_deterministic_fastpath:
+                            suspect_obj, verify_obj, miss_confirmed = _build_judge_objects_from_deterministic(
+                                deterministic_judge
+                            )
+                            judge_path = "hybrid_deterministic_fastpath"
+                            probe_runtime_stats["judge_deterministic_fastpath"] = _as_int(
+                                probe_runtime_stats.get("judge_deterministic_fastpath"), 0
+                            ) + 1
+                        else:
+                            probe_runtime_stats["judge_llm_suspect"] = _as_int(
+                                probe_runtime_stats.get("judge_llm_suspect"), 0
+                            ) + 1
+                            try:
+                                suspect_obj = judge_loss_suspected(
+                                    cfg=shared.probe_llm_cfg,
+                                    anchor=anchor,
+                                    probe_question=probe_question,
+                                    assistant_reply=assistant_text,
+                                )
+                            except Exception as exc:
+                                suspect_obj = {
+                                    "loss_suspected": False,
+                                    "confidence_0_1": 0.0,
+                                    "remembered_points": [],
+                                    "missing_points": [],
+                                    "reason_short": f"suspect_judge_error:{exc.__class__.__name__}:{exc}",
+                                }
+
+                            suspect_true = bool(suspect_obj.get("loss_suspected"))
+                            verify_always = bool(shared.args.probe_llm_verify_always)
+                            should_run_verify = verify_always or suspect_true
+                            if should_run_verify:
+                                probe_runtime_stats["judge_llm_verify"] = _as_int(
+                                    probe_runtime_stats.get("judge_llm_verify"), 0
+                                ) + 1
+                                if verify_always and (not suspect_true):
+                                    probe_runtime_stats["judge_llm_verify_forced"] = _as_int(
+                                        probe_runtime_stats.get("judge_llm_verify_forced"), 0
+                                    ) + 1
+                                try:
+                                    verify_obj = verify_loss_confirmed(
+                                        cfg=shared.probe_llm_cfg,
+                                        anchor=anchor,
+                                        probe_question=probe_question,
+                                        assistant_reply=assistant_text,
+                                        suspect_reason=str(suspect_obj.get("reason_short") or ""),
+                                        conversation_window=_build_conversation_window(turn_results, turn_idx),
+                                    )
+                                except Exception as exc:
+                                    verify_obj = {
+                                        "forgotten": False,
+                                        "confidence_0_1": 0.0,
+                                        "score_0_100": 0.0,
+                                        "reason": f"verify_judge_error:{exc.__class__.__name__}:{exc}",
+                                        "evidence_refs": [],
+                                    }
+                            else:
+                                probe_runtime_stats["judge_llm_verify_skipped"] = _as_int(
+                                    probe_runtime_stats.get("judge_llm_verify_skipped"), 0
+                                ) + 1
+                                verify_obj = {
+                                    "forgotten": False,
+                                    "confidence_0_1": 0.0,
+                                    "score_0_100": 0.0,
+                                    "reason": "suspect_false_skip_verify",
+                                    "evidence_refs": [],
+                                }
+                            miss_confirmed = bool(verify_obj.get("forgotten"))
+                            if should_run_verify:
+                                if judge_mode == "hybrid":
+                                    judge_path = "hybrid_llm_verify_forced" if (verify_always and (not suspect_true)) else "hybrid_llm_verify"
+                                else:
+                                    judge_path = "llm_only_verify_forced" if (verify_always and (not suspect_true)) else "llm_only_verify"
+                            else:
+                                judge_path = "hybrid_llm_suspect_only" if judge_mode == "hybrid" else "llm_only_suspect_only"
 
                 probe_checks.append(
                     {
@@ -2438,6 +4100,8 @@ def _run_single_session(shared: SharedRuntime, session_idx: int, focus_turn: int
                         ),
                         "probe_anchor_point_id": str(probe_question_meta.get("anchor_point_id") or ""),
                         "probe_anchor_point_text": str(probe_question_meta.get("anchor_point_text") or ""),
+                        "judge_path": judge_path,
+                        "deterministic_judge": deterministic_judge,
                         "suspect_judge": suspect_obj,
                         "verify_judge": verify_obj,
                         "miss_confirmed": miss_confirmed,
@@ -2453,6 +4117,21 @@ def _run_single_session(shared: SharedRuntime, session_idx: int, focus_turn: int
                         "verify_reason": str(verify_obj.get("reason") or ""),
                         "evidence_refs": verify_obj.get("evidence_refs"),
                     }
+
+            if first_compaction_signal_turn is None and _turn_has_compaction_signal(result):
+                first_compaction_signal_turn = turn_idx
+                print(
+                    "[INFO] compaction_signal_detected "
+                    f"session={session_idx} turn={turn_idx}"
+                )
+
+            flush_checkpoint(
+                status="ready_for_turn",
+                next_turn_idx=turn_idx + 1,
+                current_turn=turn_idx,
+                turn_kind=turn_kind,
+                user_text=user_text,
+            )
 
             if result.get("run_error"):
                 if _as_bool(os.getenv("AUTO_TEST_AUTO_CANCEL_ON_RUN_ERROR", "true"), True):
@@ -2472,6 +4151,13 @@ def _run_single_session(shared: SharedRuntime, session_idx: int, focus_turn: int
                     "[WARN] turn_error "
                     f"session={session_idx} turn={turn_idx} run_error={result.get('run_error')}"
                 )
+                flush_checkpoint(
+                    status="error",
+                    next_turn_idx=turn_idx,
+                    current_turn=turn_idx,
+                    turn_kind=turn_kind,
+                    user_text=user_text,
+                )
                 break
 
             if session_wall_timeout_sec > 0 and (time.time() - session_started_at) > session_wall_timeout_sec:
@@ -2480,6 +4166,13 @@ def _run_single_session(shared: SharedRuntime, session_idx: int, focus_turn: int
                     "[WARN] session_wall_timeout "
                     f"session={session_idx} elapsed_sec={round(time.time() - session_started_at, 2)} "
                     f"limit_sec={session_wall_timeout_sec} after_turn={turn_idx}"
+                )
+                flush_checkpoint(
+                    status="timeout",
+                    next_turn_idx=turn_idx,
+                    current_turn=turn_idx,
+                    turn_kind=turn_kind,
+                    user_text=user_text,
                 )
                 break
 
@@ -2625,6 +4318,7 @@ def _run_single_session(shared: SharedRuntime, session_idx: int, focus_turn: int
         "probe_runtime": probe_runtime_stats,
         "probe_turns_executed": probe_turns_executed,
         "probe_checks_count": len(probe_checks),
+        "first_compaction_signal_turn": first_compaction_signal_turn,
         "first_failure_turn_raw": first_failure_turn_raw,
         "first_failure_turn_effective": first_failure_turn_effective,
         "turns_executed": len(turn_results),
@@ -2635,6 +4329,11 @@ def _run_single_session(shared: SharedRuntime, session_idx: int, focus_turn: int
         "failure_policy": failure_policy,
         "session_gating": session_gating,
         "compaction_completion": compaction_completion,
+        "checkpoint": {
+            "enabled": resume_enabled,
+            "resume_count": session_resume_count,
+            "checkpoint_file": checkpoint_path.relative_to(shared.sessions_root.parent).as_posix(),
+        },
         "health": session_health,
         "stats": {
             "compaction_events": compaction_events,
@@ -2661,6 +4360,13 @@ def _run_single_session(shared: SharedRuntime, session_idx: int, focus_turn: int
     (session_dir / "session_meta.json").write_text(
         json.dumps(session_payload, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
+    )
+    flush_checkpoint(
+        status="completed",
+        next_turn_idx=max(1, len(turn_results) + 1),
+        current_turn=max(0, len(turn_results)),
+        turn_kind="",
+        user_text="",
     )
     print(
         "[INFO] session_done "
@@ -2782,10 +4488,27 @@ def main() -> int:
     print(f"[INFO] probe_similarity_threshold={args.probe_similarity_threshold}")
     print(f"[INFO] probe_recent_window={args.probe_recent_window}")
     print(f"[INFO] probe_regen_max_attempts={args.probe_regen_max_attempts}")
+    print(f"[INFO] probe_post_compaction_window_offsets={list(args.probe_post_compaction_window_offsets)}")
+    print(f"[INFO] probe_max_density={args.probe_max_density}")
+    print(f"[INFO] probe_judge_mode={args.probe_judge_mode}")
+    print(f"[INFO] probe_llm_skip_fastpath={args.probe_llm_skip_fastpath}")
+    print(f"[INFO] probe_llm_verify_always={args.probe_llm_verify_always}")
+    print(f"[INFO] spotcheck_enabled={args.spotcheck_enabled}")
+    print(f"[INFO] spotcheck_sample_rate={args.spotcheck_sample_rate}")
+    print(f"[INFO] spotcheck_min_samples={args.spotcheck_min_samples}")
+    print(f"[INFO] spotcheck_max_samples={args.spotcheck_max_samples}")
+    print(f"[INFO] spotcheck_seed={args.spotcheck_seed}")
+    print(f"[INFO] turn_gateway_404_retry_max={args.turn_gateway_404_retry_max}")
+    print(f"[INFO] turn_gateway_404_retry_backoff_sec={args.turn_gateway_404_retry_backoff_sec}")
     print(f"[INFO] focus_window={args.focus_window}")
     print(f"[INFO] parallel_sessions={args.parallel_sessions}")
     print(f"[INFO] importance_tier={args.importance_tier}")
     print(f"[INFO] min_post_samples_per_tier={args.min_post_samples_per_tier}")
+    print(f"[INFO] checkpoint_resume_enabled={args.checkpoint_resume_enabled}")
+    print(f"[INFO] validity_min_verified_sessions={args.validity_min_verified_sessions}")
+    print(f"[INFO] validity_max_session_run_error_rate={args.validity_max_session_run_error_rate}")
+    print(f"[INFO] validity_min_compaction_completion_rate={args.validity_min_compaction_completion_rate}")
+    print(f"[INFO] validity_ci_max_half_width={args.validity_ci_max_half_width}")
     print(f"[INFO] persist_type={persist_type}")
     print(f"[INFO] exec_max_turns={exec_max_turns}")
     print(f"[INFO] dotai_base_url={dotai_base_url or '(disabled)'}")
@@ -2841,7 +4564,7 @@ def main() -> int:
         if isinstance(s.get("first_failure_turn_effective"), int)
     ]
     chart_sessions_without_failure = sum(1 for s in chart_sessions if s.get("first_failure_turn_effective") is None)
-    chart_title = f"Memory Compression Failure Turn Distribution (exclude first {args.warmup_sessions} warmup sessions)"
+    chart_title = f"压缩失败轮次分布（已排除前 {args.warmup_sessions} 个预热会话）"
     chart_meta = _write_distribution_svg(aggregate_root / "failure_turn_distribution.svg", chart_values, chart_title)
 
     aggregate = {
@@ -2862,9 +4585,29 @@ def main() -> int:
         min_post_samples_per_tier=args.min_post_samples_per_tier,
     )
     probe_runtime_summary = _build_probe_runtime_summary(session_payloads_sorted)
+    probe_spotcheck_summary = _build_probe_spotcheck_summary(
+        session_payloads=session_payloads_sorted,
+        result_root=result_root,
+        probe_llm_cfg=probe_llm_cfg,
+        args=args,
+    )
+    probe_outcome_rows = _collect_probe_outcome_rows(
+        session_payloads=session_payloads_sorted,
+        result_root=result_root,
+    )
     aggregate["pipeline_health_summary"] = pipeline_health_summary
     aggregate["compression_effect_summary"] = compression_effect_summary
     aggregate["probe_runtime_summary"] = probe_runtime_summary
+    aggregate["probe_spotcheck_summary"] = probe_spotcheck_summary
+    aggregate["probe_outcome_summary"] = {
+        "pass_count": len(probe_outcome_rows.get("pass", [])),
+        "fail_count": len(probe_outcome_rows.get("fail", [])),
+    }
+    statistical_validity = _build_statistical_validity_summary(
+        aggregate=aggregate,
+        args=args,
+    )
+    aggregate["statistical_validity"] = statistical_validity
 
     summary_payload = {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -2884,10 +4627,27 @@ def main() -> int:
             "probe_similarity_threshold": args.probe_similarity_threshold,
             "probe_recent_window": args.probe_recent_window,
             "probe_regen_max_attempts": args.probe_regen_max_attempts,
+            "probe_post_compaction_window_offsets": list(args.probe_post_compaction_window_offsets),
+            "probe_max_density": args.probe_max_density,
+            "probe_judge_mode": args.probe_judge_mode,
+            "probe_llm_skip_fastpath": args.probe_llm_skip_fastpath,
+            "probe_llm_verify_always": args.probe_llm_verify_always,
+            "spotcheck_enabled": args.spotcheck_enabled,
+            "spotcheck_sample_rate": args.spotcheck_sample_rate,
+            "spotcheck_min_samples": args.spotcheck_min_samples,
+            "spotcheck_max_samples": args.spotcheck_max_samples,
+            "spotcheck_seed": args.spotcheck_seed,
+            "turn_gateway_404_retry_max": args.turn_gateway_404_retry_max,
+            "turn_gateway_404_retry_backoff_sec": args.turn_gateway_404_retry_backoff_sec,
             "focus_window": args.focus_window,
             "parallel_sessions": args.parallel_sessions,
             "importance_tier": args.importance_tier,
             "min_post_samples_per_tier": args.min_post_samples_per_tier,
+            "checkpoint_resume_enabled": args.checkpoint_resume_enabled,
+            "validity_min_verified_sessions": args.validity_min_verified_sessions,
+            "validity_max_session_run_error_rate": args.validity_max_session_run_error_rate,
+            "validity_min_compaction_completion_rate": args.validity_min_compaction_completion_rate,
+            "validity_ci_max_half_width": args.validity_ci_max_half_width,
             "persist_type": persist_type,
             "exec_max_turns": exec_max_turns,
             "run_settings": run_settings,
@@ -2932,6 +4692,43 @@ def main() -> int:
         encoding="utf-8",
     )
     _build_compression_effect_report_md(aggregate_root / "compression_effect_report.md", summary_payload)
+    (aggregate_root / "probe_spotcheck_summary.json").write_text(
+        json.dumps(probe_spotcheck_summary, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _build_probe_spotcheck_report_md(
+        aggregate_root / "probe_spotcheck_report.md",
+        probe_spotcheck_summary,
+    )
+    (aggregate_root / "statistical_validity_summary.json").write_text(
+        json.dumps(statistical_validity, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _build_statistical_validity_report_md(
+        aggregate_root / "statistical_validity_proof.md",
+        statistical_validity,
+    )
+    (aggregate_root / "probe_checks_pass.json").write_text(
+        json.dumps(probe_outcome_rows.get("pass", []), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    (aggregate_root / "probe_checks_fail.json").write_text(
+        json.dumps(probe_outcome_rows.get("fail", []), ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    _build_probe_outcome_report_md(
+        path=aggregate_root / "probe_checks_pass.md",
+        rows=probe_outcome_rows.get("pass", []),
+        report_title="探针通过清单",
+        report_intro="本文件列出所有判定为“通过/未确认遗忘”的 probe_check，包含判定理由和涉及原文内容。",
+    )
+    _build_probe_outcome_report_md(
+        path=aggregate_root / "probe_checks_fail.md",
+        rows=probe_outcome_rows.get("fail", []),
+        report_title="探针失败清单",
+        report_intro="本文件列出所有判定为“失败/确认遗忘”的 probe_check，包含判定理由和涉及原文内容。",
+    )
+    _build_results_readme_md(result_root / "README.md")
 
     (result_root / "run_manifest.json").write_text(
         json.dumps(
@@ -2948,7 +4745,16 @@ def main() -> int:
                 "aggregate_pipeline_health_md": (aggregate_root / "pipeline_health_report.md").as_posix(),
                 "aggregate_compression_effect_json": (aggregate_root / "compression_effect_summary.json").as_posix(),
                 "aggregate_compression_effect_md": (aggregate_root / "compression_effect_report.md").as_posix(),
+                "aggregate_probe_spotcheck_json": (aggregate_root / "probe_spotcheck_summary.json").as_posix(),
+                "aggregate_probe_spotcheck_md": (aggregate_root / "probe_spotcheck_report.md").as_posix(),
+                "aggregate_probe_pass_json": (aggregate_root / "probe_checks_pass.json").as_posix(),
+                "aggregate_probe_pass_md": (aggregate_root / "probe_checks_pass.md").as_posix(),
+                "aggregate_probe_fail_json": (aggregate_root / "probe_checks_fail.json").as_posix(),
+                "aggregate_probe_fail_md": (aggregate_root / "probe_checks_fail.md").as_posix(),
+                "aggregate_statistical_validity_json": (aggregate_root / "statistical_validity_summary.json").as_posix(),
+                "aggregate_statistical_validity_md": (aggregate_root / "statistical_validity_proof.md").as_posix(),
                 "aggregate_distribution_chart": chart_meta.get("chart_path"),
+                "results_readme_md": (result_root / "README.md").as_posix(),
                 "session_count": len(session_payloads_sorted),
                 "session_dirs": [f"session_{i:02d}" for i in range(1, len(session_payloads_sorted) + 1)],
             },

@@ -127,6 +127,53 @@ def _render_history_for_user_sim(results: list[dict[str, Any]], max_items: int =
     return "\n".join(lines).strip()
 
 
+def _count_workspace_refs(text: str) -> int:
+    if not text:
+        return 0
+    return len(re.findall(r"/workspace/[^\s\"'`<>(){}\\]+", text))
+
+
+def _workspace_delivery_signals(
+    snapshot: dict[str, Any] | None,
+    latest_assistant: str,
+) -> dict[str, Any]:
+    if not isinstance(snapshot, dict):
+        snapshot = {}
+    counts = snapshot.get("counts")
+    if not isinstance(counts, dict):
+        counts = {}
+    all_paths_count = int(counts.get("all_paths") or 0)
+    md_files_count = int(counts.get("md_files") or 0)
+    image_files_count = int(counts.get("image_files") or 0)
+    recent_touched_count = int(counts.get("recent_touched_paths") or 0)
+    recent_text_artifacts_count = int(counts.get("recent_text_artifacts") or 0)
+    recent_image_files_count = int(counts.get("recent_image_files") or 0)
+    assistant_workspace_refs = _count_workspace_refs(str(latest_assistant or ""))
+
+    recent_delivery_signal = (
+        recent_touched_count > 0
+        or recent_text_artifacts_count > 0
+        or recent_image_files_count > 0
+    )
+    persistent_workspace_signal = (
+        all_paths_count > 0
+        or md_files_count > 0
+        or image_files_count > 0
+        or assistant_workspace_refs > 0
+    )
+    return {
+        "recent_delivery_signal": bool(recent_delivery_signal),
+        "persistent_workspace_signal": bool(persistent_workspace_signal),
+        "all_paths_count": all_paths_count,
+        "md_files_count": md_files_count,
+        "image_files_count": image_files_count,
+        "recent_touched_count": recent_touched_count,
+        "recent_text_artifacts_count": recent_text_artifacts_count,
+        "recent_image_files_count": recent_image_files_count,
+        "assistant_workspace_refs": assistant_workspace_refs,
+    }
+
+
 def render_user_sim_scenario(template: str, max_turns: int, capability_mode: str) -> str:
     mode = normalize_capability_mode(capability_mode)
     return (
@@ -413,6 +460,7 @@ def generate_user_turn_with_simulator(
     latest_assistant = str((results[-1] if results else {}).get("assistant_text") or "")
     history_text = _render_history_for_user_sim(results)
     workspace_text = render_workspace_snapshot_for_user_sim(workspace_snapshot)
+    delivery_signals = _workspace_delivery_signals(workspace_snapshot, latest_assistant)
     current_focus = capability_focus_for_turn(sim_cfg.capability_mode, turn_idx)
 
     user_prompt = (
@@ -423,11 +471,22 @@ def generate_user_turn_with_simulator(
         f"Current role profile:\n{role.role_profile}\n\n"
         f"Recent dialogue history:\n{history_text}\n\n"
         f"User-visible workspace snapshot:\n{workspace_text}\n\n"
+        "Delivery signals summary:\n"
+        f"- recent_delivery_signal={delivery_signals.get('recent_delivery_signal', False)}\n"
+        f"- persistent_workspace_signal={delivery_signals.get('persistent_workspace_signal', False)}\n"
+        f"- all_paths_count={delivery_signals.get('all_paths_count', 0)}\n"
+        f"- md_files_count={delivery_signals.get('md_files_count', 0)}\n"
+        f"- image_files_count={delivery_signals.get('image_files_count', 0)}\n"
+        f"- recent_touched_count={delivery_signals.get('recent_touched_count', 0)}\n"
+        f"- recent_text_artifacts_count={delivery_signals.get('recent_text_artifacts_count', 0)}\n"
+        f"- recent_image_files_count={delivery_signals.get('recent_image_files_count', 0)}\n"
+        f"- latest_assistant_workspace_refs={delivery_signals.get('assistant_workspace_refs', 0)}\n\n"
         f"Latest assistant reply:\n{latest_assistant}\n\n"
         "Decision rules:\n"
-        "1. If workspace snapshot already has turn_touched_preview / turn_text_artifacts / turn_image_artifacts, treat it as delivered.\n"
-        "2. When delivery exists, continue with revision/refinement/next-step requests; do not claim \"nothing delivered\".\n"
-        "3. Only report missing delivery when snapshot is empty or truly lacks delivery signals.\n\n"
+        "1. If recent_delivery_signal=true, treat delivery as completed for this turn.\n"
+        "2. If recent_delivery_signal=false but persistent_workspace_signal=true, treat it as likely delivered; ask refinement/confirmation instead of declaring missing.\n"
+        "3. Only report missing delivery when both signals are false and snapshot is truly empty.\n"
+        "4. Do not claim \"nothing delivered\" when latest assistant reply already references workspace outputs.\n\n"
         "Output rules:\n"
         "1. Output JSON only.\n"
         '2. JSON schema: {"user_text":"...","stop":false,"reason":""}\n'
